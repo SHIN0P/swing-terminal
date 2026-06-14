@@ -4,7 +4,27 @@ import random
 from datetime import datetime, timedelta
 
 CACHE = {}
-CACHE_TTL = 900  # 15 min
+
+
+def is_market_open():
+    """True only during NSE trading hours (IST Mon-Fri 09:15-15:30)."""
+    ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    if ist.weekday() >= 5:
+        return False
+    t = ist.hour * 100 + ist.minute
+    return 915 <= t <= 1530
+
+
+def stable_ttl():
+    """
+    During market hours  → 15-minute cache (prices change).
+    Outside market hours → cache until midnight IST (scores must not drift).
+    """
+    if is_market_open():
+        return 900
+    ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    midnight = ist.replace(hour=23, minute=59, second=59, microsecond=0)
+    return max(3600, int((midnight - ist).total_seconds()))
 
 NSE_HEADERS = {
     'User-Agent': (
@@ -23,14 +43,14 @@ NSE_HEADERS = {
 
 def cache_get(key):
     if key in CACHE:
-        data, ts = CACHE[key]
-        if (datetime.now() - ts).total_seconds() < CACHE_TTL:
+        data, ts, ttl = CACHE[key]
+        if (datetime.now() - ts).total_seconds() < ttl:
             return data
     return None
 
 
-def cache_set(key, data):
-    CACHE[key] = (data, datetime.now())
+def cache_set(key, data, ttl=None):
+    CACHE[key] = (data, datetime.now(), ttl if ttl is not None else stable_ttl())
 
 
 # ── NSE session ────────────────────────────────────────────────────────────────
@@ -49,20 +69,22 @@ def get_nse_session():
 # ── Sample / fallback data ─────────────────────────────────────────────────────
 
 def make_sample_fii_dii(days=30):
+    # Each calendar day gets its own seed → same day always returns same numbers.
     result = []
     for i in range(days, 0, -1):
         d = datetime.now() - timedelta(days=i)
         if d.weekday() >= 5:
             continue
-        fii_net = random.randint(-3000, 4000)
-        dii_net = random.randint(-500,  5000)
+        rng = random.Random(int(d.strftime('%Y%m%d')))
+        fii_net = rng.randint(-3000, 4000)
+        dii_net = rng.randint(-500,  5000)
         result.append({
             'date':     d.strftime('%d-%b-%Y'),
-            'fii_buy':  abs(fii_net) + random.randint(5000, 15000),
-            'fii_sell': abs(fii_net) + random.randint(4000, 13000),
+            'fii_buy':  abs(fii_net) + rng.randint(5000, 15000),
+            'fii_sell': abs(fii_net) + rng.randint(4000, 13000),
             'fii_net':  fii_net,
-            'dii_buy':  abs(dii_net) + random.randint(3000, 10000),
-            'dii_sell': abs(dii_net) + random.randint(2000,  8000),
+            'dii_buy':  abs(dii_net) + rng.randint(3000, 10000),
+            'dii_sell': abs(dii_net) + rng.randint(2000,  8000),
             'dii_net':  dii_net,
         })
     return result[-days:]
@@ -232,58 +254,68 @@ def get_stock_list():
 # ── Price history ──────────────────────────────────────────────────────────────
 
 def get_stock_history(symbol, days=90):
-    cached = cache_get(f'hist_{symbol}')
+    cache_key = f'hist_{symbol}'
+    cached = cache_get(cache_key)
     if cached:
         return cached
 
-    try:
-        import yfinance as yf
-        sym = symbol if '.NS' in symbol else f'{symbol}.NS'
-        df  = yf.download(sym, period='4mo', interval='1d', progress=False, auto_adjust=True)
-        if df.empty:
-            raise ValueError('No data returned')
-        df.reset_index(inplace=True)
-        result = []
-        for _, row in df.iterrows():
-            result.append({
-                'date':   str(row['Date'])[:10],
-                'open':   float(row['Open']),
-                'high':   float(row['High']),
-                'low':    float(row['Low']),
-                'close':  float(row['Close']),
-                'volume': int(row['Volume']),
-            })
-        cache_set(f'hist_{symbol}', result)
-        return result
-    except Exception as e:
-        print(f'History failed for {symbol}: {e} — generating sample')
+    # Try yfinance up to 3 times — it works even when NSE blocks direct API calls.
+    import yfinance as yf
+    yf_sym = symbol if '.NS' in symbol else f'{symbol}.NS'
+    for attempt in range(3):
+        try:
+            df = yf.download(yf_sym, period='4mo', interval='1d',
+                             progress=False, auto_adjust=True)
+            if df.empty:
+                raise ValueError('empty dataframe')
+            df.reset_index(inplace=True)
+            result = []
+            for _, row in df.iterrows():
+                result.append({
+                    'date':   str(row['Date'])[:10],
+                    'open':   float(row['Open']),
+                    'high':   float(row['High']),
+                    'low':    float(row['Low']),
+                    'close':  float(row['Close']),
+                    'volume': int(row['Volume']),
+                })
+            cache_set(cache_key, result)   # uses stable_ttl() automatically
+            print(f'yfinance OK: {symbol} ({len(result)} rows)')
+            return result
+        except Exception as e:
+            print(f'yfinance attempt {attempt + 1}/3 failed for {symbol}: {e}')
+            if attempt < 2:
+                time.sleep(2)
 
-    # Synthetic fallback
+    print(f'All yfinance attempts failed for {symbol} — using deterministic fallback')
+
+    # Deterministic fallback: fixed per-symbol seed → scores never drift between refreshes.
+    rng        = random.Random(hash(symbol) % 100_000)
     stocks_ref = {s['symbol']: s for s in TOP50_DATA}
     base_price = float(stocks_ref.get(symbol, {}).get('lastPrice', 1000))
-    price      = base_price * random.uniform(0.88, 1.0)
+    price      = base_price * rng.uniform(0.88, 1.0)
     result     = []
     for i in range(90, 0, -1):
         d = datetime.now() - timedelta(days=i)
         if d.weekday() >= 5:
             continue
-        price *= (1 + random.uniform(-0.025, 0.028))
-        h = price * random.uniform(1.005, 1.02)
-        lv = price * random.uniform(0.98, 0.995)
+        price *= (1 + rng.uniform(-0.025, 0.028))
+        h  = price * rng.uniform(1.005, 1.02)
+        lv = price * rng.uniform(0.98,  0.995)
         result.append({
             'date':   d.strftime('%Y-%m-%d'),
             'open':   round(price * 0.998, 2),
-            'high':   round(h, 2),
+            'high':   round(h,  2),
             'low':    round(lv, 2),
             'close':  round(price, 2),
-            'volume': random.randint(500000, 5000000),
+            'volume': rng.randint(500_000, 5_000_000),
         })
-    # Nudge the last price toward the actual reference
+    # Anchor last close to the reference price so trade levels make sense.
     if result and base_price:
         drift = base_price / result[-1]['close']
         result[-1]['close'] = round(result[-1]['close'] * drift, 2)
 
-    cache_set(f'hist_{symbol}', result)
+    cache_set(cache_key, result)   # stable_ttl() → holds until midnight IST when market closed
     return result
 
 

@@ -1,0 +1,85 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  font-family: 'JetBrains Mono', monospace;
+  box-sizing: border-box;
+}
+
+body {
+  background: #080C10;
+  color: #E6EDF3;
+  margin: 0;
+  padding: 0;
+}
+
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: #0D1117; }
+::-webkit-scrollbar-thumb { background: #00E5A0; border-radius: 4px; }
+::selection { background: rgba(0,229,160,0.25); }
+
+@keyframes radarSweep {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+@keyframes pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50%       { transform: scale(1.7); opacity: 0.3; }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(22px); }
+  to   { opacity: 1; transform: translateY(0px); }
+}
+
+@keyframes floatUp {
+  0%   { transform: translateY(100vh); opacity: 0; }
+  5%   { opacity: 0.07; }
+  95%  { opacity: 0.07; }
+  100% { transform: translateY(-120px); opacity: 0; }
+}
+
+@keyframes typewriter {
+  from { width: 0; }
+  to   { width: 100%; }
+}
+
+@keyframes scanLine {
+  from { width: 0%; opacity: 1; }
+  to   { width: 100%; opacity: 0; }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes glowPulse {
+  0%, 100% { box-shadow: 0 0 8px rgba(0,229,160,0.3); }
+  50%       { box-shadow: 0 0 24px rgba(0,229,160,0.6); }
+}
+
+.card-entrance {
+  animation: slideUp 0.4s ease forwards;
+  opacity: 0;
+}
+
+.spin-icon {
+  animation: spin 1s linear infinite;
+}
+
+.scan-line {
+  position: fixed;
+  top: 0; left: 0;
+  height: 2px;
+  background: #00E5A0;
+  animation: scanLine 2s ease forwards;
+  z-index: 999;
+}

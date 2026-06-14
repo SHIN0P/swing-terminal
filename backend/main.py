@@ -224,7 +224,7 @@ def scanner_endpoint(min_score: int = 0, sector: str = 'all', limit: int = 50):
     fii_10d  = sum(d['fii_net'] for d in fii_data)
 
     results = []
-    for stock in stocks[:100]:
+    for stock in stocks[:40]:   # cap at 40 — beyond this yfinance latency kills the request
         sym          = stock.get('symbol', '')
         stock_sector = stock.get('sector', 'Consumer')
 

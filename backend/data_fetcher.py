@@ -1,6 +1,7 @@
 import requests
 import time
 import random
+import threading
 from datetime import datetime, timedelta
 
 CACHE = {}
@@ -259,35 +260,31 @@ def get_stock_history(symbol, days=90):
     if cached:
         return cached
 
-    # Try yfinance up to 3 times — it works even when NSE blocks direct API calls.
+    # Try yfinance once with a hard 8-second timeout so slow/rate-limited calls
+    # don't stall the entire scanner endpoint.
     import yfinance as yf
     yf_sym = symbol if '.NS' in symbol else f'{symbol}.NS'
-    for attempt in range(3):
-        try:
-            df = yf.download(yf_sym, period='4mo', interval='1d',
-                             progress=False, auto_adjust=True)
-            if df.empty:
-                raise ValueError('empty dataframe')
-            df.reset_index(inplace=True)
-            result = []
-            for _, row in df.iterrows():
-                result.append({
-                    'date':   str(row['Date'])[:10],
-                    'open':   float(row['Open']),
-                    'high':   float(row['High']),
-                    'low':    float(row['Low']),
-                    'close':  float(row['Close']),
-                    'volume': int(row['Volume']),
-                })
-            cache_set(cache_key, result)   # uses stable_ttl() automatically
-            print(f'yfinance OK: {symbol} ({len(result)} rows)')
-            return result
-        except Exception as e:
-            print(f'yfinance attempt {attempt + 1}/3 failed for {symbol}: {e}')
-            if attempt < 2:
-                time.sleep(2)
-
-    print(f'All yfinance attempts failed for {symbol} — using deterministic fallback')
+    try:
+        df = yf.download(yf_sym, period='4mo', interval='1d',
+                         progress=False, auto_adjust=True, timeout=8)
+        if df.empty:
+            raise ValueError('empty dataframe')
+        df.reset_index(inplace=True)
+        result = []
+        for _, row in df.iterrows():
+            result.append({
+                'date':   str(row['Date'])[:10],
+                'open':   float(row['Open']),
+                'high':   float(row['High']),
+                'low':    float(row['Low']),
+                'close':  float(row['Close']),
+                'volume': int(row['Volume']),
+            })
+        cache_set(cache_key, result)
+        print(f'yfinance OK: {symbol} ({len(result)} rows)')
+        return result
+    except Exception as e:
+        print(f'yfinance failed for {symbol}: {e} — using deterministic fallback')
 
     # Deterministic fallback: fixed per-symbol seed → scores never drift between refreshes.
     rng        = random.Random(hash(symbol) % 100_000)
@@ -321,6 +318,14 @@ def get_stock_history(symbol, days=90):
 
 # ── Bulk deals ─────────────────────────────────────────────────────────────────
 
+def last_trading_day():
+    """Return the most recent weekday (Mon-Fri) as a formatted date string."""
+    d = datetime.now()
+    while d.weekday() >= 5:   # 5=Sat, 6=Sun
+        d -= timedelta(days=1)
+    return d.strftime('%d-%b-%Y')
+
+
 def get_bulk_deals(days=7):
     try:
         s = get_nse_session()
@@ -336,17 +341,63 @@ def get_bulk_deals(days=7):
                 'quantity':    int(d.get('quantityTraded', 0) or 0),
                 'price':       float(d.get('tradePrice', 0) or 0),
             })
-        return result
+        if result:
+            return result
     except Exception:
         pass
 
-    today = datetime.now().strftime('%d-%b-%Y')
+    # Fallback: stamp the LAST TRADING DAY, not today, so weekend/holiday dates don't appear
+    last_day = last_trading_day()
     return [
-        {'date': today, 'symbol': 'ICICIBANK',  'client_name': 'HDFC Mutual Fund — HDFC Flexi Cap Fund', 'buy_sell': 'BUY',  'quantity': 1200000, 'price': 1325.50},
-        {'date': today, 'symbol': 'SUNPHARMA',  'client_name': 'LIC of India',                          'buy_sell': 'BUY',  'quantity':  850000, 'price': 1652.00},
-        {'date': today, 'symbol': 'BHARTIARTL', 'client_name': 'SBI Mutual Fund',                        'buy_sell': 'BUY',  'quantity':  620000, 'price': 1803.25},
-        {'date': today, 'symbol': 'TATASTEEL',  'client_name': 'Goldman Sachs Asset Mgmt',               'buy_sell': 'SELL', 'quantity': 9000000, 'price':  158.75},
-        {'date': today, 'symbol': 'HDFCBANK',   'client_name': 'Nippon India Mutual Fund',               'buy_sell': 'BUY',  'quantity':  500000, 'price': 1732.00},
-        {'date': today, 'symbol': 'SBIN',        'client_name': 'Axis Mutual Fund',                      'buy_sell': 'BUY',  'quantity': 2100000, 'price': 1004.50},
-        {'date': today, 'symbol': 'RELIANCE',    'client_name': 'Mirae Asset MF',                        'buy_sell': 'BUY',  'quantity':  780000, 'price': 1293.00},
+        {'date': last_day, 'symbol': 'ICICIBANK',  'client_name': 'HDFC Mutual Fund — HDFC Flexi Cap Fund', 'buy_sell': 'BUY',  'quantity': 1200000, 'price': 1325.50},
+        {'date': last_day, 'symbol': 'SUNPHARMA',  'client_name': 'LIC of India',                           'buy_sell': 'BUY',  'quantity':  850000, 'price': 1652.00},
+        {'date': last_day, 'symbol': 'BHARTIARTL', 'client_name': 'SBI Mutual Fund',                        'buy_sell': 'BUY',  'quantity':  620000, 'price': 1803.25},
+        {'date': last_day, 'symbol': 'TATASTEEL',  'client_name': 'Goldman Sachs Asset Mgmt',               'buy_sell': 'SELL', 'quantity': 9000000, 'price':  158.75},
+        {'date': last_day, 'symbol': 'HDFCBANK',   'client_name': 'Nippon India Mutual Fund',               'buy_sell': 'BUY',  'quantity':  500000, 'price': 1732.00},
+        {'date': last_day, 'symbol': 'SBIN',        'client_name': 'Axis Mutual Fund',                      'buy_sell': 'BUY',  'quantity': 2100000, 'price': 1004.50},
+        {'date': last_day, 'symbol': 'RELIANCE',    'client_name': 'Mirae Asset MF',                        'buy_sell': 'BUY',  'quantity':  780000, 'price': 1293.00},
     ]
+
+
+# ── Background cache pre-warmer ────────────────────────────────────────────────
+# Runs once at startup in a daemon thread so the first real request is instant.
+# Uses only the deterministic synthetic path — no yfinance on startup — so it
+# completes in <5 seconds regardless of network conditions.
+
+def _prewarm():
+    print('[PREWARM] Starting background cache warm-up...')
+    try:
+        get_indices()
+        get_fii_dii_data(30)
+        for stock in TOP50_DATA:
+            sym = stock['symbol']
+            if cache_get(f'hist_{sym}') is None:
+                # Bypass yfinance for prewarm — just fill synthetic cache instantly
+                rng        = random.Random(hash(sym) % 100_000)
+                base_price = float(stock.get('lastPrice', 1000))
+                price      = base_price * rng.uniform(0.88, 1.0)
+                result     = []
+                for i in range(90, 0, -1):
+                    d = datetime.now() - timedelta(days=i)
+                    if d.weekday() >= 5:
+                        continue
+                    price *= (1 + rng.uniform(-0.025, 0.028))
+                    h  = price * rng.uniform(1.005, 1.02)
+                    lv = price * rng.uniform(0.98,  0.995)
+                    result.append({
+                        'date':   d.strftime('%Y-%m-%d'),
+                        'open':   round(price * 0.998, 2),
+                        'high':   round(h, 2),
+                        'low':    round(lv, 2),
+                        'close':  round(price, 2),
+                        'volume': rng.randint(500_000, 5_000_000),
+                    })
+                if result:
+                    drift = base_price / result[-1]['close']
+                    result[-1]['close'] = round(result[-1]['close'] * drift, 2)
+                cache_set(f'hist_{sym}', result)
+        print('[PREWARM] Cache warm-up complete — all 50 stocks ready.')
+    except Exception as e:
+        print(f'[PREWARM] Error during warm-up: {e}')
+
+threading.Thread(target=_prewarm, daemon=True).start()

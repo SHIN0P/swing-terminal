@@ -22,7 +22,7 @@ def stable_ttl():
     Outside market hours → cache until midnight IST (scores must not drift).
     """
     if is_market_open():
-        return 900
+        return 21600  # 6 hours — scores stay stable within a trading session
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     midnight = ist.replace(hour=23, minute=59, second=59, microsecond=0)
     return max(3600, int((midnight - ist).total_seconds()))
@@ -265,7 +265,7 @@ def get_stock_history(symbol, days=90):
     import yfinance as yf
     yf_sym = symbol if '.NS' in symbol else f'{symbol}.NS'
     try:
-        df = yf.download(yf_sym, period='4mo', interval='1d',
+        df = yf.download(yf_sym, period='3mo', interval='1d',
                          progress=False, auto_adjust=True, timeout=8)
         if df.empty:
             raise ValueError('empty dataframe')

@@ -101,6 +101,12 @@ def market_pulse():
 
     sensex_est = indices.get('nifty50', 23000) * 3.27
 
+    _idx_entry = CACHE.get('indices')
+    last_update = (
+        _idx_entry[1].strftime('%d %b %Y, %I:%M %p IST')
+        if _idx_entry else 'Loading...'
+    )
+
     return {
         'nifty50':           indices.get('nifty50', 0),
         'nifty50_change':    indices.get('nifty50_change', 0),
@@ -115,6 +121,7 @@ def market_pulse():
         'market_signal_text': text,
         'fii_today':         round(fii_today, 2),
         'dii_today':         round(dii_today, 2),
+        'last_data_update':  last_update,
     }
 
 

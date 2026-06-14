@@ -1,18 +1,50 @@
 import time
+import sys
+import traceback
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from data_fetcher import (
-    get_fii_dii_data, get_indices, get_stock_list,
-    get_stock_history, get_bulk_deals, CACHE,
-)
-from indicators import compute_indicators
-from scorer import score_stock, get_signal, get_trade_levels
-from database import (
-    get_portfolio, add_to_portfolio, delete_from_portfolio,
-    update_portfolio_price,
-)
+# ── Safe imports with explicit error logging ───────────────────────────────────
+# If any module fails to import the error prints to Render logs instead of
+# silently producing a bare FastAPI app with no routes.
+
+_import_errors = []
+
+try:
+    from data_fetcher import (
+        get_fii_dii_data, get_indices, get_stock_list,
+        get_stock_history, get_bulk_deals, CACHE,
+    )
+except Exception as _e:
+    _import_errors.append(f"data_fetcher: {_e}")
+    traceback.print_exc()
+
+try:
+    from indicators import compute_indicators
+except Exception as _e:
+    _import_errors.append(f"indicators: {_e}")
+    traceback.print_exc()
+
+try:
+    from scorer import score_stock, get_signal, get_trade_levels
+except Exception as _e:
+    _import_errors.append(f"scorer: {_e}")
+    traceback.print_exc()
+
+try:
+    from database import (
+        get_portfolio, add_to_portfolio, delete_from_portfolio,
+        update_portfolio_price,
+    )
+except Exception as _e:
+    _import_errors.append(f"database: {_e}")
+    traceback.print_exc()
+
+if _import_errors:
+    print(f"[STARTUP ERROR] Failed imports: {_import_errors}", file=sys.stderr)
+else:
+    print("[STARTUP OK] All modules imported successfully.")
 
 app = FastAPI(title='Swing Terminal API', version='1.0')
 
@@ -405,4 +437,18 @@ def refresh_data():
 
 @app.get('/')
 def root():
-    return {'status': 'Swing Terminal API running', 'version': '1.0'}
+    return {
+        'status': 'Market Swing API is running',
+        'version': '1.0',
+        'import_errors': _import_errors,   # empty list = all good
+        'endpoints': [
+            '/api/market-pulse',
+            '/api/fii-dii',
+            '/api/sectors',
+            '/api/scanner',
+            '/api/opportunities',
+            '/api/bulk-deals',
+            '/api/portfolio',
+            '/api/refresh',
+        ],
+    }

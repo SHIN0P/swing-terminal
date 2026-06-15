@@ -1,36 +1,19 @@
 import { useState, useEffect } from 'react'
 
-const getColor = score => {
-  if (score >= 80) return '#00E5A0'
-  if (score >= 65) return '#58A6FF'
-  if (score >= 50) return '#E3B341'
-  if (score >= 35) return '#F97316'
-  return '#F85149'
-}
-
-const getLabel = score => {
-  if (score >= 80) return 'STRONG BUY'
-  if (score >= 65) return 'BUY'
-  if (score >= 50) return 'WATCHLIST'
-  if (score >= 35) return 'HOLD'
-  return 'AVOID'
-}
+const getColor = s => s >= 80 ? '#00E5A0' : s >= 65 ? '#4D9FFF' : s >= 50 ? '#FFB020' : s >= 35 ? '#F97316' : '#FF455A'
+const getLabel = s => s >= 80 ? 'STRONG BUY' : s >= 65 ? 'BUY' : s >= 50 ? 'WATCHLIST' : s >= 35 ? 'HOLD' : 'AVOID'
 
 export default function ScoreGauge({ score = 0, size = 'md' }) {
   const dim = size === 'sm' ? 80 : size === 'lg' ? 160 : 120
-  const [displayScore, setDisplayScore] = useState(0)
+  const [disp, setDisp] = useState(0)
 
   useEffect(() => {
-    let current = 0
-    const target = score
+    let cur = 0
+    const tgt = score
     const timer = setInterval(() => {
-      current += target / 75
-      if (current >= target) {
-        setDisplayScore(target)
-        clearInterval(timer)
-      } else {
-        setDisplayScore(Math.floor(current))
-      }
+      cur += tgt / 60
+      if (cur >= tgt) { setDisp(tgt); clearInterval(timer) }
+      else setDisp(Math.floor(cur))
     }, 16)
     return () => clearInterval(timer)
   }, [score])
@@ -39,49 +22,44 @@ export default function ScoreGauge({ score = 0, size = 'md' }) {
   const label = getLabel(score)
   const cx = dim / 2
   const cy = dim / 2
-  const r = dim / 2 - 10
-  const circumference = Math.PI * r
-  const offset = circumference - (displayScore / 100) * circumference
+  const r = dim / 2 - 12
+  const circ = Math.PI * r
+  const offset = circ - (disp / 100) * circ
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-      <svg width={dim} height={dim / 2 + 20} viewBox={`0 0 ${dim} ${dim / 2 + 20}`}>
+      <svg width={dim} height={dim / 2 + 24} viewBox={`0 0 ${dim} ${dim / 2 + 24}`}>
         <path
           d={`M ${cx - r} ${cy} A ${r} ${r} 0 0 1 ${cx + r} ${cy}`}
-          fill="none" stroke="#21293A" strokeWidth="8" strokeLinecap="round"
+          fill="none" stroke="#1A1F2B" strokeWidth={size === 'sm' ? 6 : 8} strokeLinecap="round"
         />
         <path
           d={`M ${cx - r} ${cy} A ${r} ${r} 0 0 1 ${cx + r} ${cy}`}
-          fill="none" stroke={color} strokeWidth="8"
+          fill="none" stroke={color} strokeWidth={size === 'sm' ? 6 : 8}
           strokeLinecap="round"
-          strokeDasharray={circumference}
+          strokeDasharray={circ}
           strokeDashoffset={offset}
-          style={{
-            transition: 'stroke-dashoffset 0.05s linear',
-            filter: `drop-shadow(0 0 6px ${color})`,
-          }}
+          style={{ transition: 'stroke-dashoffset 0.05s linear', filter: `drop-shadow(0 0 5px ${color}80)` }}
         />
         <text x={cx} y={cy - 4}
           textAnchor="middle" dominantBaseline="middle"
           fill={color}
-          fontSize={size === 'sm' ? 14 : size === 'lg' ? 28 : 20}
-          fontWeight="700"
-          fontFamily="JetBrains Mono, monospace">
-          {displayScore}
+          fontSize={size === 'sm' ? 14 : size === 'lg' ? 28 : 22}
+          fontWeight="700" fontFamily="JetBrains Mono, monospace">
+          {disp}
         </text>
         <text x={cx} y={cy + (size === 'sm' ? 10 : 14)}
-          textAnchor="middle"
-          fill="#8B949E"
+          textAnchor="middle" fill="#4B5563"
           fontSize={size === 'sm' ? 7 : 9}
           fontFamily="JetBrains Mono, monospace">
           /100
         </text>
       </svg>
       <div style={{
-        fontSize: size === 'sm' ? 8 : 10,
-        color, fontWeight: 700,
-        letterSpacing: 1.5,
-        marginTop: -8,
+        fontSize: size === 'sm' ? 8 : 9, color, fontWeight: 700,
+        letterSpacing: 1.5, marginTop: -6,
+        padding: '2px 8px', borderRadius: 2,
+        background: color + '15', border: `1px solid ${color}30`,
       }}>
         {label}
       </div>

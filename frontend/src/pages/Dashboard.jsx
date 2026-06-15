@@ -3,13 +3,54 @@ import { useNavigate } from 'react-router-dom'
 import Loader from '../components/Loader'
 import SectorHeatmap from '../components/SectorHeatmap'
 import ScoreGauge from '../components/ScoreGauge'
-import useCountUp from '../hooks/useCountUp'
 import { getMarketPulse, getSectors, getOpportunities } from '../services/api'
 
+const FMT  = (v, d = 2) => (v || 0).toLocaleString('en-IN', { maximumFractionDigits: d })
+const CHG  = v => (v || 0) >= 0
+const SIGN = v => (v || 0) >= 0 ? '+' : ''
+
+function IndexCard({ label, value, change, extra, delay = 0 }) {
+  const pos = CHG(change)
+  return (
+    <div className="card-entrance hud-panel" style={{ padding: '12px 14px', animationDelay: `${delay}s` }}>
+      <div style={{ fontSize: 8, color: '#4B5563', letterSpacing: 2, marginBottom: 6, fontWeight: 700 }}>{label}</div>
+      <div style={{ fontSize: 19, fontWeight: 700, color: '#C8D0DC', letterSpacing: -0.5 }} className="num">
+        {FMT(value)}
+      </div>
+      {change !== undefined && (
+        <div style={{ fontSize: 10, color: pos ? '#00E5A0' : '#FF455A', marginTop: 4, display: 'flex', alignItems: 'center', gap: 3 }}>
+          <span>{pos ? '▲' : '▼'}</span>
+          <span className="num">{Math.abs(change || 0).toFixed(2)}%</span>
+        </div>
+      )}
+      {extra}
+    </div>
+  )
+}
+
+function FlowCard({ label, net, delay = 0 }) {
+  const pos = (net || 0) >= 0
+  return (
+    <div className="card-entrance" style={{
+      animationDelay: `${delay}s`,
+      background: '#10141C', border: `1px solid ${pos ? 'rgba(0,229,160,0.12)' : 'rgba(255,69,90,0.12)'}`,
+      borderRadius: 4, padding: '12px 14px',
+    }}>
+      <div style={{ fontSize: 8, color: '#4B5563', letterSpacing: 2, marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 16, fontWeight: 700, color: pos ? '#00E5A0' : '#FF455A' }} className="num">
+        {pos ? '+' : ''}₹{FMT(Math.abs(net || 0), 0)} Cr
+      </div>
+      <div style={{ fontSize: 9, color: '#2A3040', marginTop: 4, letterSpacing: 1 }}>
+        {pos ? '▲ NET BUYING' : '▼ NET SELLING'} TODAY
+      </div>
+    </div>
+  )
+}
+
 export default function Dashboard() {
-  const [pulse, setPulse] = useState(null)
+  const [pulse, setPulse]   = useState(null)
   const [sectors, setSectors] = useState([])
-  const [opportunities, setOpportunities] = useState([])
+  const [opps, setOpps]     = useState([])
   const [loading, setLoading] = useState(true)
   const navigate = useNavigate()
 
@@ -17,151 +58,150 @@ export default function Dashboard() {
     const load = async () => {
       setLoading(true)
       const [p, s, o] = await Promise.all([getMarketPulse(), getSectors(), getOpportunities()])
-      setPulse(p)
-      setSectors(s)
-      setOpportunities(o)
+      setPulse(p); setSectors(s); setOpps(o)
       setLoading(false)
     }
     load()
-    const interval = setInterval(load, 5 * 60 * 1000)
-    return () => clearInterval(interval)
+    const id = setInterval(load, 5 * 60 * 1000)
+    return () => clearInterval(id)
   }, [])
 
-  const n50 = useCountUp(pulse?.nifty50 || 0)
-  const sx  = useCountUp(pulse?.sensex || 0)
-  const vix = useCountUp(pulse?.india_vix || 0, 800)
-  const nb  = useCountUp(pulse?.nifty_bank || 0)
+  const vixColor = (v) => (v || 0) > 20 ? '#FF455A' : (v || 0) > 15 ? '#FFB020' : '#00E5A0'
+  const sigColor = pulse?.signal_color || '#4B5563'
 
-  const card = (label, value, change, extra) => (
-    <div className="card-entrance" style={{
-      background: '#161B22', border: '1px solid #21293A',
-      borderRadius: 10, padding: '16px 18px',
-    }}>
-      <div style={{ fontSize: 10, color: '#8B949E', letterSpacing: 2, marginBottom: 6 }}>{label}</div>
-      <div style={{ fontSize: 22, fontWeight: 700, color: '#E6EDF3' }}>
-        {value.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
-      </div>
-      {change !== undefined && (
-        <div style={{ fontSize: 12, color: change >= 0 ? '#00E5A0' : '#F85149', marginTop: 3 }}>
-          {change >= 0 ? '▲' : '▼'} {Math.abs(change).toFixed(2)}%
-        </div>
-      )}
-      {extra}
-    </div>
-  )
+  const SECONDARY_INDICES = [
+    { label: 'NIFTY IT',     val: pulse?.nifty_it,     chg: pulse?.nifty_it_change },
+    { label: 'NIFTY AUTO',   val: pulse?.nifty_auto,   chg: pulse?.nifty_auto_change },
+    { label: 'NIFTY PHARMA', val: pulse?.nifty_pharma, chg: pulse?.nifty_pharma_change },
+    { label: 'NIFTY FMCG',   val: pulse?.nifty_fmcg,  chg: pulse?.nifty_fmcg_change },
+    { label: 'NIFTY METAL',  val: pulse?.nifty_metal,  chg: pulse?.nifty_metal_change },
+  ]
 
   return (
     <div>
       <Loader isLoading={loading} />
 
-      <div style={{ marginBottom: 24 }}>
-        <div style={{ fontSize: 11, color: '#00E5A0', letterSpacing: 3, fontWeight: 700 }}>
-          SWING INTELLIGENCE TERMINAL
-        </div>
-        <h1 style={{ margin: '4px 0 0', fontSize: 22, fontWeight: 700, color: '#E6EDF3' }}>
-          Market Dashboard
-        </h1>
-        <div style={{ fontSize: 11, color: '#8B949E', marginTop: 3 }}>
-          {new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
-        </div>
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 20 }}>
-        {card('NIFTY 50', n50, pulse?.nifty50_change)}
-        {card('SENSEX', sx, pulse?.sensex_change)}
-        {card('INDIA VIX', parseFloat((vix || 0).toFixed(1)), undefined,
-          <div style={{ fontSize: 10, marginTop: 3,
-            color: (pulse?.india_vix || 0) > 18 ? '#F85149' : (pulse?.india_vix || 0) > 14 ? '#E3B341' : '#00E5A0' }}>
-            {(pulse?.india_vix || 0) > 18 ? '⚠ HIGH ALERT' : (pulse?.india_vix || 0) > 14 ? '● ELEVATED' : '● CALM'}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 18 }}>
+        <div>
+          <div style={{ fontSize: 8, color: '#00E5A0', letterSpacing: 3, fontWeight: 700, marginBottom: 2 }}>
+            MARKET DASHBOARD
           </div>
-        )}
-        {card('NIFTY BANK', nb, pulse?.nifty_bank_change)}
+          <div style={{ fontSize: 16, fontWeight: 700, color: '#C8D0DC' }}>
+            Indian Market Overview
+          </div>
+        </div>
+        <div style={{ fontSize: 9, color: '#2A3040', textAlign: 'right', letterSpacing: 1 }}>
+          <div>{new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long' })}</div>
+          <div style={{ marginTop: 2 }}>
+            {pulse?.data_source && <span>SRC: {pulse.data_source?.toUpperCase()}</span>}
+          </div>
+        </div>
       </div>
 
-      {pulse && (
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 8 }}>
+        <IndexCard label="NIFTY 50"   value={pulse?.nifty50}   change={pulse?.nifty50_change}   delay={0} />
+        <IndexCard label="SENSEX"     value={pulse?.sensex}    change={pulse?.sensex_change}    delay={0.04} />
+        <IndexCard label="BANK NIFTY" value={pulse?.nifty_bank} change={pulse?.nifty_bank_change} delay={0.08} />
+        <IndexCard label="INDIA VIX"  value={pulse?.india_vix} change={pulse?.india_vix_change} delay={0.12}
+          extra={
+            <div style={{ fontSize: 8, color: vixColor(pulse?.india_vix), marginTop: 4, letterSpacing: 1 }}>
+              {(pulse?.india_vix || 0) > 20 ? '● PANIC ZONE' : (pulse?.india_vix || 0) > 15 ? '● CAUTION' : '● STABLE'}
+            </div>
+          }
+        />
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 6, marginBottom: 16 }}>
+        {SECONDARY_INDICES.map((idx, i) => {
+          const pos = CHG(idx.chg)
+          return (
+            <div key={idx.label} className="card-entrance" style={{
+              animationDelay: `${0.15 + i * 0.04}s`,
+              background: '#0A0E14', border: '1px solid #0F1318',
+              borderRadius: 3, padding: '8px 10px',
+            }}>
+              <div style={{ fontSize: 8, color: '#2A3040', letterSpacing: 1, marginBottom: 4 }}>{idx.label}</div>
+              <div style={{ fontSize: 12, fontWeight: 600, color: '#8B99A8' }} className="num">
+                {FMT(idx.val)}
+              </div>
+              <div style={{ fontSize: 9, color: pos ? '#00E5A0' : '#FF455A', marginTop: 2 }} className="num">
+                {pos ? '▲' : '▼'} {Math.abs(idx.chg || 0).toFixed(2)}%
+              </div>
+            </div>
+          )
+        })}
+      </div>
+
+      {pulse?.market_signal && (
         <div style={{
-          padding: '14px 18px', borderRadius: 8, marginBottom: 24,
-          background: (pulse.signal_color || '#8B949E') + '20',
-          borderLeft: `4px solid ${pulse.signal_color || '#8B949E'}`,
+          padding: '10px 14px', borderRadius: 3, marginBottom: 16,
+          background: sigColor + '12',
+          border: `1px solid ${sigColor}30`,
+          borderLeft: `3px solid ${sigColor}`,
+          display: 'flex', alignItems: 'center', gap: 14,
         }}>
-          <div style={{ fontSize: 13, fontWeight: 700, color: pulse.signal_color || '#8B949E' }}>
-            {pulse.market_signal === 'BULLISH' ? '📈' :
-             pulse.market_signal === 'RANGE-BOUND' ? '↔️' :
-             pulse.market_signal === 'BEARISH' ? '📉' : '⚠️'} {pulse.market_signal}
+          <div>
+            <div style={{ fontSize: 10, fontWeight: 700, color: sigColor, letterSpacing: 1 }}>
+              {pulse.market_signal}
+            </div>
+            <div style={{ fontSize: 10, color: '#4B5563', marginTop: 2 }}>{pulse.market_signal_text}</div>
           </div>
-          <div style={{ fontSize: 11, color: '#8B949E', marginTop: 3 }}>
-            {pulse.market_signal_text}
-          </div>
+          {pulse.last_updated && (
+            <div style={{ marginLeft: 'auto', fontSize: 8, color: '#1A1F2B', letterSpacing: 1 }}>
+              UPDATED {pulse.last_updated}
+            </div>
+          )}
         </div>
       )}
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, marginBottom: 24 }}>
-        {[
-          { label: 'FOREIGN INSTITUTIONS (FII)', net: pulse?.fii_today },
-          { label: 'DOMESTIC INSTITUTIONS (DII)', net: pulse?.dii_today },
-        ].map(({ label, net }) => (
-          <div key={label} style={{
-            background: '#161B22', border: '1px solid #21293A',
-            borderRadius: 10, padding: '14px 18px',
-          }}>
-            <div style={{ fontSize: 9, color: '#8B949E', letterSpacing: 2, marginBottom: 8 }}>
-              {label} — TODAY
-            </div>
-            <div style={{
-              fontSize: 20, fontWeight: 700,
-              color: (net || 0) >= 0 ? '#00E5A0' : '#F85149',
-            }}>
-              {(net || 0) >= 0 ? '+' : ''}₹{Math.abs(net || 0).toLocaleString('en-IN')} Cr
-            </div>
-            <div style={{ fontSize: 10, color: '#8B949E', marginTop: 2 }}>
-              {(net || 0) >= 0 ? 'Net Buying' : 'Net Selling'}
-            </div>
-          </div>
-        ))}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 20 }}>
+        <FlowCard label="FII — FOREIGN INSTITUTIONS" net={pulse?.fii_today} delay={0.2} />
+        <FlowCard label="DII — DOMESTIC INSTITUTIONS" net={pulse?.dii_today} delay={0.24} />
       </div>
 
-      <div style={{ marginBottom: 24 }}>
-        <div style={{ fontSize: 11, color: '#8B949E', letterSpacing: 2, marginBottom: 12, fontWeight: 700 }}>
-          SECTOR PERFORMANCE TODAY
-        </div>
-        <SectorHeatmap sectors={sectors} />
-      </div>
-
-      <div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-          <div style={{ fontSize: 11, color: '#8B949E', letterSpacing: 2, fontWeight: 700 }}>
-            TODAY'S TOP SETUPS
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: 16 }}>
+        <div className="hud-panel" style={{ padding: '14px' }}>
+          <div className="section-header">
+            <span className="section-header-label">Sector Heatmap</span>
+            <span className="section-header-accent" />
+            <span style={{ fontSize: 8, color: '#1A1F2B', letterSpacing: 1 }}>1D CHANGE</span>
           </div>
-          <button onClick={() => navigate('/opportunities')} style={{
-            background: 'none', border: '1px solid #21293A',
-            color: '#00E5A0', fontSize: 10, padding: '4px 10px',
-            borderRadius: 4, cursor: 'pointer', letterSpacing: 1,
-          }}>
-            VIEW ALL →
-          </button>
+          <SectorHeatmap sectors={sectors} />
         </div>
-        <div style={{ display: 'flex', gap: 12, overflowX: 'auto', paddingBottom: 8 }}>
-          {opportunities.slice(0, 5).map((op, i) => (
-            <div key={op.symbol} className="card-entrance"
-              style={{ animationDelay: `${i * 0.1}s`, flexShrink: 0 }}>
-              <div style={{
-                background: '#161B22', border: '1px solid #21293A',
-                borderRadius: 10, padding: '14px 16px', minWidth: 150,
-                textAlign: 'center',
-              }}>
-                <div style={{ fontSize: 13, fontWeight: 700, color: '#E6EDF3', marginBottom: 4 }}>
-                  {op.symbol}
+
+        <div className="hud-panel" style={{ padding: '14px' }}>
+          <div className="section-header">
+            <span className="section-header-label">Top Setups</span>
+            <span className="section-header-accent" />
+            <button onClick={() => navigate('/opportunities')} style={{
+              background: 'none', border: 'none', color: '#00E5A0',
+              fontSize: 8, cursor: 'pointer', letterSpacing: 1, fontFamily: 'inherit',
+            }}>ALL →</button>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {opps.slice(0, 6).map((op, i) => {
+              const sc = op.composite_score || 0
+              const c = sc >= 80 ? '#00E5A0' : sc >= 65 ? '#4D9FFF' : '#FFB020'
+              return (
+                <div key={op.symbol} className="card-entrance data-row" style={{
+                  animationDelay: `${i * 0.06}s`,
+                  display: 'flex', alignItems: 'center', gap: 10,
+                  padding: '7px 6px', position: 'relative',
+                  background: 'transparent',
+                }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: '#C8D0DC' }}>{op.symbol}</div>
+                    <div style={{ fontSize: 8, color: '#2A3040', marginTop: 1 }}>{op.sector}</div>
+                  </div>
+                  <div style={{ textAlign: 'right' }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: c }} className="num">{sc}</div>
+                    <div style={{ fontSize: 8, color: '#2A3040' }}>/ 100</div>
+                  </div>
+                  <div style={{ width: 2, height: 28, background: c + '60', borderRadius: 1 }} />
                 </div>
-                <div style={{ fontSize: 9, color: '#8B949E', marginBottom: 10 }}>
-                  {op.sector}
-                </div>
-                <ScoreGauge score={op.composite_score} size="sm" />
-                <div style={{ fontSize: 10, color: '#8B949E', marginTop: 8 }}>
-                  Entry ₹{op.entry_zone_low}+
-                </div>
-              </div>
-            </div>
-          ))}
+              )
+            })}
+          </div>
         </div>
       </div>
     </div>

@@ -99,7 +99,9 @@ def market_pulse():
         signal = 'RANGE-BOUND'; color = '#58A6FF'
         text   = 'Markets consolidating. Select stock-specific opportunities only.'
 
-    sensex_est = indices.get('nifty50', 23000) * 3.27
+    # Use real sensex from yfinance if available, else estimate from nifty
+    sensex_val = indices.get('sensex') or round(indices.get('nifty50', 23000) * 3.27, 2)
+    sensex_chg = indices.get('sensex_change') or round(indices.get('nifty50_change', 0) * 0.97, 2)
 
     _idx_entry = CACHE.get('indices')
     last_update = (
@@ -110,8 +112,8 @@ def market_pulse():
     return {
         'nifty50':           indices.get('nifty50', 0),
         'nifty50_change':    indices.get('nifty50_change', 0),
-        'sensex':            round(sensex_est, 2),
-        'sensex_change':     round(indices.get('nifty50_change', 0) * 0.97, 2),
+        'sensex':            round(sensex_val, 2),
+        'sensex_change':     round(sensex_chg, 2),
         'india_vix':         indices.get('india_vix', 0),
         'india_vix_change':  indices.get('india_vix_change', 0),
         'nifty_bank':        indices.get('nifty_bank', 0),
@@ -122,6 +124,7 @@ def market_pulse():
         'fii_today':         round(fii_today, 2),
         'dii_today':         round(dii_today, 2),
         'last_data_update':  last_update,
+        'data_source':       indices.get('data_source', 'fallback'),
     }
 
 
@@ -279,7 +282,7 @@ def scanner_endpoint(min_score: int = 0, sector: str = 'all', limit: int = 50):
 
 @app.get('/api/opportunities')
 def opportunities_endpoint():
-    stocks   = get_stock_list()
+    stocks   = get_stock_list() 
     indices  = get_indices()
     fii_data = get_fii_dii_data(10)
     fii_10d  = sum(d['fii_net'] for d in fii_data)

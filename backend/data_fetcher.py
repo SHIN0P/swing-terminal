@@ -22,7 +22,7 @@ def stable_ttl():
     Outside market hours → cache until midnight IST (scores must not drift).
     """
     if is_market_open():
-        return 21600  # 6 hours — scores stay stable within a trading session
+        return 3600  # 1 hour during market hours
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     midnight = ist.replace(hour=23, minute=59, second=59, microsecond=0)
     return max(3600, int((midnight - ist).total_seconds()))
@@ -145,34 +145,84 @@ def get_indices():
         'nifty_infra': 8921.0,      'nifty_infra_change': 0.5,
         'nifty_telecom': 2150.0,    'nifty_telecom_change': 2.1,
         'nifty_midcap150': 19820.0, 'nifty_midcap150_change': 0.9,
+        'data_source': 'fallback',
     }
 
+    # Yahoo Finance tickers for NSE indices (works from Render; NSE API is blocked)
+    YF_MAP = {
+        '^NSEI':     ('nifty50',      'nifty50_change'),
+        '^BSESN':    ('sensex',       'sensex_change'),
+        '^INDIAVIX': ('india_vix',    'india_vix_change'),
+        '^NSEBANK':  ('nifty_bank',   'nifty_bank_change'),
+        '^CNXIT':    ('nifty_it',     'nifty_it_change'),
+        '^CNXPHARMA':('nifty_pharma', 'nifty_pharma_change'),
+        '^CNXAUTO':  ('nifty_auto',   'nifty_auto_change'),
+        '^CNXFMCG':  ('nifty_fmcg',  'nifty_fmcg_change'),
+        '^CNXMETAL': ('nifty_metal',  'nifty_metal_change'),
+    }
+
+    # Primary: yfinance
     try:
-        s = get_nse_session()
-        r = s.get('https://www.nseindia.com/api/allIndices', timeout=15)
-        data = r.json().get('data', [])
-        mapping = {
-            'NIFTY 50':      ('nifty50',     'nifty50_change'),
-            'INDIA VIX':     ('india_vix',   'india_vix_change'),
-            'NIFTY BANK':    ('nifty_bank',  'nifty_bank_change'),
-            'NIFTY IT':      ('nifty_it',    'nifty_it_change'),
-            'NIFTY PHARMA':  ('nifty_pharma','nifty_pharma_change'),
-            'NIFTY AUTO':    ('nifty_auto',  'nifty_auto_change'),
-            'NIFTY FMCG':    ('nifty_fmcg',  'nifty_fmcg_change'),
-            'NIFTY METAL':   ('nifty_metal', 'nifty_metal_change'),
-            'NIFTY REALTY':  ('nifty_realty','nifty_realty_change'),
-            'NIFTY ENERGY':  ('nifty_energy','nifty_energy_change'),
-            'NIFTY INFRA':   ('nifty_infra', 'nifty_infra_change'),
-            'NIFTY TELECOM': ('nifty_telecom','nifty_telecom_change'),
-        }
-        for item in data:
-            sym = item.get('indexSymbol', '')
-            if sym in mapping:
-                k1, k2 = mapping[sym]
-                defaults[k1] = float(item.get('last',          defaults[k1]) or defaults[k1])
-                defaults[k2] = float(item.get('percentChange', defaults[k2]) or defaults[k2])
+        import yfinance as yf
+        fetched = 0
+        for ticker, (k1, k2) in YF_MAP.items():
+            try:
+                hist = yf.Ticker(ticker).history(period='5d')
+                if hist.empty:
+                    continue
+                closes = hist['Close'].dropna()
+                if len(closes) == 0:
+                    continue
+                last = float(closes.iloc[-1])
+                defaults[k1] = round(last, 2)
+                if len(closes) >= 2:
+                    prev = float(closes.iloc[-2])
+                    if prev:
+                        defaults[k2] = round((last - prev) / prev * 100, 2)
+                fetched += 1
+            except Exception:
+                pass
+        if fetched >= 2:
+            defaults['data_source'] = 'live'
+            print(f'[INDICES] yfinance: {fetched}/{len(YF_MAP)} tickers live')
+        else:
+            print(f'[INDICES] yfinance: only {fetched} tickers returned')
     except Exception as e:
-        print(f'Indices fetch failed: {e} — using defaults')
+        print(f'[INDICES] yfinance error: {e}')
+
+    # Secondary: NSE API (fallback if yfinance fails)
+    if defaults['data_source'] == 'fallback':
+        try:
+            s = get_nse_session()
+            r = s.get('https://www.nseindia.com/api/allIndices', timeout=15)
+            data = r.json().get('data', [])
+            nse_mapping = {
+                'NIFTY 50':      ('nifty50',       'nifty50_change'),
+                'INDIA VIX':     ('india_vix',     'india_vix_change'),
+                'NIFTY BANK':    ('nifty_bank',    'nifty_bank_change'),
+                'NIFTY IT':      ('nifty_it',      'nifty_it_change'),
+                'NIFTY PHARMA':  ('nifty_pharma',  'nifty_pharma_change'),
+                'NIFTY AUTO':    ('nifty_auto',    'nifty_auto_change'),
+                'NIFTY FMCG':    ('nifty_fmcg',   'nifty_fmcg_change'),
+                'NIFTY METAL':   ('nifty_metal',   'nifty_metal_change'),
+                'NIFTY REALTY':  ('nifty_realty',  'nifty_realty_change'),
+                'NIFTY ENERGY':  ('nifty_energy',  'nifty_energy_change'),
+                'NIFTY INFRA':   ('nifty_infra',   'nifty_infra_change'),
+                'NIFTY TELECOM': ('nifty_telecom', 'nifty_telecom_change'),
+            }
+            nse_count = 0
+            for item in data:
+                sym = item.get('indexSymbol', '')
+                if sym in nse_mapping:
+                    k1, k2 = nse_mapping[sym]
+                    defaults[k1] = float(item.get('last',          defaults[k1]) or defaults[k1])
+                    defaults[k2] = float(item.get('percentChange', defaults[k2]) or defaults[k2])
+                    nse_count += 1
+            if nse_count >= 2:
+                defaults['data_source'] = 'live'
+                print(f'[INDICES] NSE API: {nse_count} indices live')
+        except Exception as e:
+            print(f'[INDICES] NSE also failed: {e} — using hardcoded defaults')
 
     cache_set('indices', defaults)
     return defaults

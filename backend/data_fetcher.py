@@ -1,3 +1,6 @@
+import hashlib
+import json
+import os
 import requests
 import time
 import random
@@ -8,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 CACHE = {}
 
 HEALTH = {
-    'yfinance_ok':     None,   # True/False/None (None = not tested yet)
+    'yfinance_ok':     None,
     'nse_ok':          None,
     'active_source':   'unknown',
     'last_live_fetch': None,
@@ -16,6 +19,100 @@ HEALTH = {
     'bulk_deals_real': None,
     'fii_dii_real':    None,
 }
+
+# ── Disk cache ─────────────────────────────────────────────────────────────────
+# Persists computed prices and scores across server restarts so the data is
+# identical after a restart as it was before — no recomputation needed.
+
+CACHE_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data_cache')
+_disk_lock = threading.Lock()
+
+# Per-process in-memory store of today's price histories (loaded from disk once).
+_DISK_PRICES: dict = {}
+_DISK_PRICES_LOADED = False
+
+
+def get_today_str() -> str:
+    """IST date string used as disk-cache filename suffix (YYYY-MM-DD)."""
+    ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    return ist.strftime('%Y-%m-%d')
+
+
+def _ensure_cache_dir():
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def disk_cache_path(name: str) -> str:
+    _ensure_cache_dir()
+    return os.path.join(CACHE_DIR, f'{name}_{get_today_str()}.json')
+
+
+def disk_cache_get(name: str):
+    """Read today's named cache from disk. Returns None if missing or corrupt."""
+    path = disk_cache_path(name)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f'[DISK CACHE] Read error {name}: {e}')
+        return None
+
+
+def disk_cache_set(name: str, data) -> None:
+    """Atomically write data to today's named cache on disk."""
+    path = disk_cache_path(name)
+    try:
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, separators=(',', ':'))
+        os.replace(tmp, path)   # atomic on Windows and POSIX
+    except Exception as e:
+        print(f'[DISK CACHE] Write error {name}: {e}')
+
+
+def disk_cache_clear_today() -> list:
+    """Delete all cache files for today. Returns list of deleted filenames."""
+    today   = get_today_str()
+    cleared = []
+    try:
+        if os.path.exists(CACHE_DIR):
+            for fname in os.listdir(CACHE_DIR):
+                if today in fname:
+                    try:
+                        os.remove(os.path.join(CACHE_DIR, fname))
+                        cleared.append(fname)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return cleared
+
+
+def _sym_seed(sym: str) -> int:
+    """Deterministic 0..99999 seed for a stock symbol.
+    Uses MD5 so it is immune to PYTHONHASHSEED randomization between restarts."""
+    return int(hashlib.md5(sym.encode()).hexdigest(), 16) % 100_000
+
+
+def _load_disk_prices() -> dict:
+    """Load today's price histories from disk into the module-level dict (once)."""
+    global _DISK_PRICES, _DISK_PRICES_LOADED
+    if _DISK_PRICES_LOADED:
+        return _DISK_PRICES
+    loaded = disk_cache_get('prices')
+    if isinstance(loaded, dict) and loaded:
+        _DISK_PRICES = loaded
+        print(f'[DISK CACHE] Loaded prices for {len(loaded)} stocks from disk')
+    _DISK_PRICES_LOADED = True
+    return _DISK_PRICES
+
+
+def _save_disk_prices() -> None:
+    """Persist the in-memory price dict to disk (called under _disk_lock)."""
+    if _DISK_PRICES:
+        disk_cache_set('prices', _DISK_PRICES)
 
 
 def is_market_open():
@@ -395,44 +492,22 @@ def get_stock_list():
 
 # ── Price history ──────────────────────────────────────────────────────────────
 
-def get_stock_history(symbol, days=90):
-    cache_key = f'hist_{symbol}'
-    cached = cache_get(cache_key)
-    if cached:
-        return cached
-
-    # Use Ticker().history() — yf.download() returns MultiIndex columns in v1.4+
-    # which breaks row['Date'], row['Close'] etc. history() always uses simple columns.
-    import yfinance as yf
-    yf_sym = symbol if '.NS' in symbol else f'{symbol}.NS'
-    try:
-        df = yf.Ticker(yf_sym).history(period='3mo')
-        if df.empty:
-            raise ValueError('empty dataframe')
-        result = []
-        for date, row in df.iterrows():
-            result.append({
-                'date':   str(date)[:10],
-                'open':   float(row['Open']),
-                'high':   float(row['High']),
-                'low':    float(row['Low']),
-                'close':  float(row['Close']),
-                'volume': int(row['Volume']),
-            })
-        cache_set(cache_key, result)
-        print(f'yfinance OK: {symbol} ({len(result)} rows)')
-        return result
-    except Exception as e:
-        print(f'yfinance failed for {symbol}: {e} — using deterministic fallback')
-
-    # Deterministic fallback: fixed per-symbol seed → scores never drift between refreshes.
-    rng        = random.Random(hash(symbol) % 100_000)
+def _make_deterministic_history(symbol: str) -> list:
+    """
+    Generate 90 trading days of synthetic price history for a symbol.
+    Uses MD5-based seed so output is IDENTICAL across Python restarts
+    (immune to PYTHONHASHSEED).  Never call random without this function.
+    """
+    rng        = random.Random(_sym_seed(symbol))
     stocks_ref = {s['symbol']: s for s in TOP50_DATA}
     base_price = float(stocks_ref.get(symbol, {}).get('lastPrice', 1000))
     price      = base_price * rng.uniform(0.88, 1.0)
     result     = []
+    # Use a fixed anchor date (today at midnight IST) so row dates don't shift each run
+    anchor = (datetime.utcnow() + timedelta(hours=5, minutes=30)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
     for i in range(90, 0, -1):
-        d = datetime.now() - timedelta(days=i)
+        d = anchor - timedelta(days=i)
         if d.weekday() >= 5:
             continue
         price *= (1 + rng.uniform(-0.025, 0.028))
@@ -446,12 +521,54 @@ def get_stock_history(symbol, days=90):
             'close':  round(price, 2),
             'volume': rng.randint(500_000, 5_000_000),
         })
-    # Anchor last close to the reference price so trade levels make sense.
     if result and base_price:
         drift = base_price / result[-1]['close']
         result[-1]['close'] = round(result[-1]['close'] * drift, 2)
+    return result
 
-    cache_set(cache_key, result)   # stable_ttl() → holds until midnight IST when market closed
+
+def get_stock_history(symbol, days=90):
+    cache_key = f'hist_{symbol}'
+
+    # 1. Memory cache (hot path — filled by prewarm or prior request)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    # 2. Disk price cache (survives server restarts — same data as yesterday's run)
+    disk_prices = _load_disk_prices()
+    if symbol in disk_prices:
+        result = disk_prices[symbol]
+        cache_set(cache_key, result)
+        return result
+
+    # 3. Try yfinance for real price data
+    import yfinance as yf
+    yf_sym = symbol if '.NS' in symbol else f'{symbol}.NS'
+    try:
+        df = yf.Ticker(yf_sym).history(period='3mo')
+        if df.empty:
+            raise ValueError('empty dataframe')
+        result = []
+        for date, row in df.iterrows():
+            result.append({
+                'date':   str(date)[:10],
+                'open':   round(float(row['Open']),   2),
+                'high':   round(float(row['High']),   2),
+                'low':    round(float(row['Low']),    2),
+                'close':  round(float(row['Close']),  2),
+                'volume': int(row['Volume']),
+            })
+        print(f'[yfinance] {symbol}: {len(result)} rows fetched')
+    except Exception as e:
+        print(f'[yfinance] {symbol} failed ({e}) — using deterministic fallback')
+        result = _make_deterministic_history(symbol)
+
+    # Save to disk and memory so all future calls (this run + restarts) use same data
+    with _disk_lock:
+        disk_prices[symbol] = result
+        _save_disk_prices()
+    cache_set(cache_key, result)
     return result
 
 
@@ -531,39 +648,46 @@ def get_bulk_deals(days=7):
 # completes in <5 seconds regardless of network conditions.
 
 def _prewarm():
+    """
+    Fill memory cache with price histories for all 50 stocks.
+    Priority: disk cache (today's file) > deterministic fallback.
+    Never calls yfinance — fast and deterministic.
+    """
     print('[PREWARM] Starting background cache warm-up...')
     try:
         get_indices()
         get_fii_dii_data(30)
-        for stock in TOP50_DATA:
+
+        # Load disk prices first — if they exist, all 50 stocks are ready instantly.
+        disk_prices  = _load_disk_prices()
+        new_symbols  = []
+
+        for stock in sorted(TOP50_DATA, key=lambda x: x['symbol']):
             sym = stock['symbol']
-            if cache_get(f'hist_{sym}') is None:
-                # Bypass yfinance for prewarm — just fill synthetic cache instantly
-                rng        = random.Random(hash(sym) % 100_000)
-                base_price = float(stock.get('lastPrice', 1000))
-                price      = base_price * rng.uniform(0.88, 1.0)
-                result     = []
-                for i in range(90, 0, -1):
-                    d = datetime.now() - timedelta(days=i)
-                    if d.weekday() >= 5:
-                        continue
-                    price *= (1 + rng.uniform(-0.025, 0.028))
-                    h  = price * rng.uniform(1.005, 1.02)
-                    lv = price * rng.uniform(0.98,  0.995)
-                    result.append({
-                        'date':   d.strftime('%Y-%m-%d'),
-                        'open':   round(price * 0.998, 2),
-                        'high':   round(h, 2),
-                        'low':    round(lv, 2),
-                        'close':  round(price, 2),
-                        'volume': rng.randint(500_000, 5_000_000),
-                    })
-                if result:
-                    drift = base_price / result[-1]['close']
-                    result[-1]['close'] = round(result[-1]['close'] * drift, 2)
-                cache_set(f'hist_{sym}', result)
-        print('[PREWARM] Cache warm-up complete — all 50 stocks ready.')
+
+            # Already in memory cache — nothing to do
+            if cache_get(f'hist_{sym}') is not None:
+                continue
+
+            # In disk cache — load to memory
+            if sym in disk_prices:
+                cache_set(f'hist_{sym}', disk_prices[sym])
+                continue
+
+            # Not on disk either — generate deterministic fallback and queue for disk save
+            result = _make_deterministic_history(sym)
+            cache_set(f'hist_{sym}', result)
+            disk_prices[sym] = result
+            new_symbols.append(sym)
+
+        # Persist any newly generated histories to disk in one write
+        if new_symbols:
+            with _disk_lock:
+                _save_disk_prices()
+            print(f'[PREWARM] Generated + saved {len(new_symbols)} new symbol histories to disk')
+
+        print(f'[PREWARM] Done — {len(TOP50_DATA)} stocks warm ({len(disk_prices)} from disk).')
     except Exception as e:
-        print(f'[PREWARM] Error during warm-up: {e}')
+        print(f'[PREWARM] Error: {e}')
 
 threading.Thread(target=_prewarm, daemon=True).start()

@@ -1,6 +1,8 @@
+import os
 import time
 import sys
 import traceback
+from datetime import datetime
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -16,6 +18,8 @@ try:
         get_fii_dii_data, get_indices, get_stock_list,
         get_stock_history, get_bulk_deals, CACHE, HEALTH, is_market_open,
         cache_get, cache_set, scanner_ttl, TOP50_DATA,
+        disk_cache_get, disk_cache_set, disk_cache_clear_today,
+        disk_cache_path, get_today_str, CACHE_DIR,
     )
 except Exception as _e:
     _import_errors.append(f"data_fetcher: {_e}")
@@ -225,32 +229,58 @@ def sectors_endpoint():
     return sorted(sectors, key=lambda x: x['score'], reverse=True)
 
 
-# ── Scanner ───────────────────────────────────────────────────────────────────
+# ── Scanner / Scoring — single source of truth ────────────────────────────────
+#
+# Flow:
+#   1. Check disk  → scores_YYYY-MM-DD.json exists? Return immediately.
+#   2. Check memory → in-process CACHE hit? Return immediately.
+#   3. Compute fresh → score all 50 stocks, save to disk + memory.
+#
+# disk  = survives restarts, identical data across the whole day
+# memory = fast path within a single process run
+
+def _ist_now_str() -> str:
+    ist = datetime.utcnow().replace(microsecond=0)
+    from datetime import timedelta as _td
+    ist += _td(hours=5, minutes=30)
+    return ist.strftime('%d %b %Y, %I:%M %p IST')
+
 
 def _build_all_scores():
     """
-    Score every stock in TOP50_DATA in fixed symbol order and cache the full
-    result list.  Called at most once per scanner_ttl() window so page refreshes
-    never re-derive scores.
+    Return the full scored stock list.  Checks disk then memory; computes
+    and persists only when neither cache is warm.
     """
-    cached = cache_get('scanner_all')
-    if cached is not None:
-        return cached
+    # ── 1. Disk cache (survives restarts) ──────────────────────────────────
+    disk_payload = disk_cache_get('scores')
+    if disk_payload is not None:
+        stocks = disk_payload.get('stocks', [])
+        ts     = disk_payload.get('computed_at_ist', 'unknown')
+        print(f'[CACHE] Using saved scores from {ts} ({len(stocks)} stocks)')
+        cache_set('scanner_all', stocks, scanner_ttl())
+        return stocks
 
-    # Always pull live prices from NSE if available, keyed by symbol.
-    live_prices = {}
+    # ── 2. Memory cache (within this process run) ───────────────────────────
+    mem = cache_get('scanner_all')
+    if mem is not None:
+        return mem
+
+    # ── 3. Compute fresh ─────────────────────────────────────────────────────
+    print('[CACHE] No cache found — computing fresh scores for all stocks')
+
+    # Pull live prices/delivery from NSE if available (merge on top of static data)
+    live_prices: dict = {}
     try:
         raw = get_stock_list()
         live_prices = {s.get('symbol', ''): s for s in raw if s.get('symbol')}
     except Exception:
         pass
 
-    # Authoritative universe: TOP50_DATA in deterministic order.
-    # Merge live price / pChange / delivery from NSE when available.
+    # Authoritative universe: TOP50_DATA sorted alphabetically — NEVER changes order
     universe = []
-    for base in TOP50_DATA:
-        sym   = base['symbol']
-        live  = live_prices.get(sym, {})
+    for base in sorted(TOP50_DATA, key=lambda x: x['symbol']):
+        sym    = base['symbol']
+        live   = live_prices.get(sym, {})
         merged = {**base}
         for field in ('lastPrice', 'pChange', 'deliveryToTradedQuantity'):
             if live.get(field) is not None:
@@ -260,6 +290,7 @@ def _build_all_scores():
     indices  = get_indices()
     fii_data = get_fii_dii_data(10)
     fii_10d  = sum(d['fii_net'] for d in fii_data)
+    ts       = _ist_now_str()
 
     results = []
     for stock in universe:
@@ -271,11 +302,10 @@ def _build_all_scores():
         history = get_stock_history(sym)
         scored  = score_stock(stock, history, fii_10d, sector_chg)
         comp    = scored['composite_score']
-
-        ind    = scored['indicators']
+        ind     = scored['indicators']
         signal, signal_color = get_signal(comp)
-        price  = ind.get('close') or float(stock.get('lastPrice', 0) or 0)
-        levels = get_trade_levels(price, ind.get('atr', price * 0.02), signal)
+        price   = ind.get('close') or float(stock.get('lastPrice', 0) or 0)
+        levels  = get_trade_levels(price, ind.get('atr', price * 0.02), signal)
 
         results.append({
             'symbol':            sym,
@@ -292,37 +322,46 @@ def _build_all_scores():
             'signal_color':      signal_color,
             'rsi':               ind.get('rsi', 50),
             'vol_ratio':         ind.get('vol_ratio', 1.0),
-            'ind':               ind,          # kept for opportunities endpoint
+            'data_timestamp':    ts,
+            'ind':               ind,   # kept internally; stripped before API response
             **levels,
         })
 
     results.sort(key=lambda x: x['composite_score'], reverse=True)
+
+    # Save to disk (persists across restarts) and memory (fast in-process)
+    disk_cache_set('scores', {'computed_at_ist': ts, 'stocks': results})
     cache_set('scanner_all', results, scanner_ttl())
-    print(f'[SCANNER] Computed {len(results)} scores, cached for {scanner_ttl()}s')
+    print(f'[CACHE] Scores computed + saved to disk ({len(results)} stocks, ts={ts})')
     return results
+
+
+def _public(r: dict) -> dict:
+    """Strip internal keys before sending a stock record to the client."""
+    return {k: v for k, v in r.items() if k != 'ind'}
 
 
 @app.get('/api/scanner')
 def scanner_endpoint(min_score: int = 0, sector: str = 'all', limit: int = 50):
     all_results = _build_all_scores()
-
     filtered = [
-        r for r in all_results
+        _public(r) for r in all_results
         if r['composite_score'] >= min_score
         and (sector == 'all' or r['sector'].lower() == sector.lower())
     ]
-
-    # Strip internal 'ind' key before returning
-    return [{k: v for k, v in r.items() if k != 'ind'} for r in filtered[:limit]]
+    return filtered[:limit]
 
 
 # ── Opportunities ─────────────────────────────────────────────────────────────
 
 @app.get('/api/opportunities')
 def opportunities_endpoint():
-    cached = cache_get('opportunities')
-    if cached is not None:
-        return cached
+    # Check disk cache directly (same daily file as scores)
+    disk_payload = disk_cache_get('scores')
+    if disk_payload is not None:
+        mem_opps = cache_get('opportunities')
+        if mem_opps is not None:
+            return mem_opps
 
     all_results = _build_all_scores()
     indices     = get_indices()
@@ -354,16 +393,14 @@ def opportunities_endpoint():
             reasons.append('Multiple technical signals aligning for swing trade setup')
             reasons.append('Strong relative strength vs Nifty 50')
 
-        risks = [
-            'Stop loss breach invalidates setup — exit immediately',
-            'Nifty 50 breakdown below key support could drag stock down',
-            'Global cues: US Fed decisions or FII risk-off events',
-        ]
+        risks = ['Stop loss breach invalidates setup — exit immediately',
+                 'Nifty 50 breakdown below key support could drag stock down',
+                 'Global cues: US Fed decisions or FII risk-off events']
         if ind.get('rsi', 50) > 65:
             risks.append('RSI elevated — limited upside before potential consolidation')
 
         candidates.append({
-            **{k: v for k, v in r.items() if k != 'ind'},
+            **_public(r),
             'reasons': reasons[:4],
             'risks':   risks[:3],
         })
@@ -481,12 +518,36 @@ def health_check():
 
 @app.get('/api/refresh')
 def refresh_data():
-    # Clear only volatile top-level caches so scores re-derive from fresh index
-    # data.  Do NOT clear hist_* entries — those are stable and expensive to
-    # rebuild, and wiping them would cause a 40-stock yfinance burst on next load.
+    # Clear volatile in-memory caches (indices, scores, opportunities).
+    # Does NOT touch hist_* or disk cache — prices stay stable.
     for key in ('indices', 'scanner_all', 'opportunities', 'fii_10', 'fii_20', 'fii_30'):
         CACHE.pop(key, None)
-    return {'message': 'Refreshed index + score caches', 'timestamp': time.time()}
+    return {'message': 'In-memory score/index caches cleared', 'timestamp': time.time()}
+
+
+@app.get('/api/force-refresh')
+def force_refresh():
+    """
+    Nuclear reset: delete today's disk cache files AND wipe all in-memory
+    caches.  Next request to /api/scanner or /api/opportunities will
+    re-fetch live data and rewrite the disk cache.
+    """
+    # 1. Delete today's disk cache files
+    deleted = disk_cache_clear_today()
+
+    # 2. Wipe all in-memory caches (including price histories)
+    keys_to_clear = [k for k in list(CACHE.keys())]
+    for key in keys_to_clear:
+        CACHE.pop(key, None)
+
+    print(f'[FORCE-REFRESH] Deleted disk files: {deleted}; cleared {len(keys_to_clear)} memory keys')
+    return {
+        'message':       'Disk + memory caches fully cleared — next load recomputes from live data',
+        'deleted_files': deleted,
+        'memory_keys':   len(keys_to_clear),
+        'cache_dir':     os.path.join(CACHE_DIR, get_today_str()),
+        'timestamp':     time.time(),
+    }
 
 
 @app.get('/')

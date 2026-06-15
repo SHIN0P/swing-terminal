@@ -3,8 +3,17 @@ import time
 import random
 import threading
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 CACHE = {}
+
+HEALTH = {
+    'yfinance_ok':    None,   # True/False/None (None = not tested yet)
+    'nse_ok':         None,
+    'active_source':  'unknown',
+    'last_live_fetch': None,
+    'last_attempt':   None,
+}
 
 
 def is_market_open():
@@ -22,7 +31,7 @@ def stable_ttl():
     Outside market hours → cache until midnight IST (scores must not drift).
     """
     if is_market_open():
-        return 3600  # 1 hour during market hours
+        return 900  # 15 minutes during market hours so prices stay fresh
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     midnight = ist.replace(hour=23, minute=59, second=59, microsecond=0)
     return max(3600, int((midnight - ist).total_seconds()))
@@ -125,6 +134,76 @@ def get_fii_dii_data(days=30):
 
 # ── Indices ────────────────────────────────────────────────────────────────────
 
+_YF_INDEX_MAP = {
+    '^NSEI':     ('nifty50',      'nifty50_change'),
+    '^BSESN':    ('sensex',       'sensex_change'),
+    '^INDIAVIX': ('india_vix',    'india_vix_change'),
+    '^NSEBANK':  ('nifty_bank',   'nifty_bank_change'),
+    '^CNXIT':    ('nifty_it',     'nifty_it_change'),
+    '^CNXPHARMA':('nifty_pharma', 'nifty_pharma_change'),
+    '^CNXAUTO':  ('nifty_auto',   'nifty_auto_change'),
+    '^CNXFMCG':  ('nifty_fmcg',  'nifty_fmcg_change'),
+    '^CNXMETAL': ('nifty_metal',  'nifty_metal_change'),
+}
+
+_NSE_INDEX_MAP = {
+    'NIFTY 50':      ('nifty50',       'nifty50_change'),
+    'INDIA VIX':     ('india_vix',     'india_vix_change'),
+    'NIFTY BANK':    ('nifty_bank',    'nifty_bank_change'),
+    'NIFTY IT':      ('nifty_it',      'nifty_it_change'),
+    'NIFTY PHARMA':  ('nifty_pharma',  'nifty_pharma_change'),
+    'NIFTY AUTO':    ('nifty_auto',    'nifty_auto_change'),
+    'NIFTY FMCG':    ('nifty_fmcg',   'nifty_fmcg_change'),
+    'NIFTY METAL':   ('nifty_metal',   'nifty_metal_change'),
+    'NIFTY REALTY':  ('nifty_realty',  'nifty_realty_change'),
+    'NIFTY ENERGY':  ('nifty_energy',  'nifty_energy_change'),
+    'NIFTY INFRA':   ('nifty_infra',   'nifty_infra_change'),
+    'NIFTY TELECOM': ('nifty_telecom', 'nifty_telecom_change'),
+}
+
+
+def _fetch_one_index(ticker):
+    """Download one index ticker via yfinance. Returns (last_price, pct_change) or None."""
+    import yfinance as yf
+    df = yf.download(ticker, period='5d', interval='1d',
+                     progress=False, auto_adjust=True, timeout=10)
+    if df.empty:
+        return None
+    closes = df['Close'].dropna()
+    if len(closes) == 0:
+        return None
+    last = float(closes.iloc[-1])
+    pct  = 0.0
+    if len(closes) >= 2:
+        prev = float(closes.iloc[-2])
+        if prev:
+            pct = round((last - prev) / prev * 100, 2)
+    return (round(last, 2), pct)
+
+
+def _yf_indices_parallel(yf_map):
+    """Fetch all tickers in parallel threads. Returns {k1: val, k2: pct, ...}."""
+    results = {}
+    try:
+        with ThreadPoolExecutor(max_workers=len(yf_map)) as ex:
+            future_to_keys = {
+                ex.submit(_fetch_one_index, ticker): (k1, k2)
+                for ticker, (k1, k2) in yf_map.items()
+            }
+            for fut in as_completed(future_to_keys, timeout=25):
+                k1, k2 = future_to_keys[fut]
+                try:
+                    res = fut.result()
+                    if res:
+                        results[k1] = res[0]
+                        results[k2] = res[1]
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f'[INDICES] parallel pool error: {e}')
+    return results
+
+
 def get_indices():
     cached = cache_get('indices')
     if cached:
@@ -146,83 +225,68 @@ def get_indices():
         'nifty_telecom': 2150.0,    'nifty_telecom_change': 2.1,
         'nifty_midcap150': 19820.0, 'nifty_midcap150_change': 0.9,
         'data_source': 'fallback',
+        'last_updated': datetime.now().strftime('%d %b %Y, %I:%M %p IST'),
     }
 
-    # Yahoo Finance tickers for NSE indices (works from Render; NSE API is blocked)
-    YF_MAP = {
-        '^NSEI':     ('nifty50',      'nifty50_change'),
-        '^BSESN':    ('sensex',       'sensex_change'),
-        '^INDIAVIX': ('india_vix',    'india_vix_change'),
-        '^NSEBANK':  ('nifty_bank',   'nifty_bank_change'),
-        '^CNXIT':    ('nifty_it',     'nifty_it_change'),
-        '^CNXPHARMA':('nifty_pharma', 'nifty_pharma_change'),
-        '^CNXAUTO':  ('nifty_auto',   'nifty_auto_change'),
-        '^CNXFMCG':  ('nifty_fmcg',  'nifty_fmcg_change'),
-        '^CNXMETAL': ('nifty_metal',  'nifty_metal_change'),
-    }
+    HEALTH['last_attempt'] = datetime.now()
 
-    # Primary: yfinance
-    try:
-        import yfinance as yf
-        fetched = 0
-        for ticker, (k1, k2) in YF_MAP.items():
-            try:
-                hist = yf.Ticker(ticker).history(period='5d')
-                if hist.empty:
-                    continue
-                closes = hist['Close'].dropna()
-                if len(closes) == 0:
-                    continue
-                last = float(closes.iloc[-1])
-                defaults[k1] = round(last, 2)
-                if len(closes) >= 2:
-                    prev = float(closes.iloc[-2])
-                    if prev:
-                        defaults[k2] = round((last - prev) / prev * 100, 2)
-                fetched += 1
-            except Exception:
-                pass
-        if fetched >= 2:
-            defaults['data_source'] = 'live'
-            print(f'[INDICES] yfinance: {fetched}/{len(YF_MAP)} tickers live')
-        else:
-            print(f'[INDICES] yfinance: only {fetched} tickers returned')
-    except Exception as e:
-        print(f'[INDICES] yfinance error: {e}')
+    # PRIMARY: yfinance — parallel fetch, retry up to 3 times on partial results
+    yf_results = {}
+    for attempt in range(3):
+        pending = {t: v for t, v in _YF_INDEX_MAP.items() if v[0] not in yf_results}
+        if not pending:
+            break
+        batch = _yf_indices_parallel(pending)
+        yf_results.update(batch)
 
-    # Secondary: NSE API (fallback if yfinance fails)
+        fetched = sum(1 for t in _YF_INDEX_MAP if _YF_INDEX_MAP[t][0] in yf_results)
+        if fetched >= 4:
+            break
+        if attempt < 2:
+            print(f'[INDICES] yfinance attempt {attempt + 1}: {fetched}/9 — retrying in 2s')
+            time.sleep(2)
+
+    fetched = sum(1 for t in _YF_INDEX_MAP if _YF_INDEX_MAP[t][0] in yf_results)
+    if fetched >= 2:
+        defaults.update(yf_results)
+        defaults['data_source']  = 'live'
+        defaults['last_updated'] = datetime.now().strftime('%d %b %Y, %I:%M %p IST')
+        HEALTH.update({'yfinance_ok': True, 'active_source': 'yfinance',
+                       'last_live_fetch': datetime.now()})
+        print(f'[INDICES] yfinance OK: {fetched}/9 tickers live')
+    else:
+        HEALTH['yfinance_ok'] = False
+        print(f'[INDICES] yfinance: only {fetched}/9 after 3 attempts — trying NSE')
+
+    # SECONDARY: NSE allIndices API
     if defaults['data_source'] == 'fallback':
         try:
             s = get_nse_session()
             r = s.get('https://www.nseindia.com/api/allIndices', timeout=15)
             data = r.json().get('data', [])
-            nse_mapping = {
-                'NIFTY 50':      ('nifty50',       'nifty50_change'),
-                'INDIA VIX':     ('india_vix',     'india_vix_change'),
-                'NIFTY BANK':    ('nifty_bank',    'nifty_bank_change'),
-                'NIFTY IT':      ('nifty_it',      'nifty_it_change'),
-                'NIFTY PHARMA':  ('nifty_pharma',  'nifty_pharma_change'),
-                'NIFTY AUTO':    ('nifty_auto',    'nifty_auto_change'),
-                'NIFTY FMCG':    ('nifty_fmcg',   'nifty_fmcg_change'),
-                'NIFTY METAL':   ('nifty_metal',   'nifty_metal_change'),
-                'NIFTY REALTY':  ('nifty_realty',  'nifty_realty_change'),
-                'NIFTY ENERGY':  ('nifty_energy',  'nifty_energy_change'),
-                'NIFTY INFRA':   ('nifty_infra',   'nifty_infra_change'),
-                'NIFTY TELECOM': ('nifty_telecom', 'nifty_telecom_change'),
-            }
             nse_count = 0
             for item in data:
                 sym = item.get('indexSymbol', '')
-                if sym in nse_mapping:
-                    k1, k2 = nse_mapping[sym]
+                if sym in _NSE_INDEX_MAP:
+                    k1, k2 = _NSE_INDEX_MAP[sym]
                     defaults[k1] = float(item.get('last',          defaults[k1]) or defaults[k1])
                     defaults[k2] = float(item.get('percentChange', defaults[k2]) or defaults[k2])
                     nse_count += 1
             if nse_count >= 2:
-                defaults['data_source'] = 'live'
-                print(f'[INDICES] NSE API: {nse_count} indices live')
+                defaults['data_source']  = 'nse'
+                defaults['last_updated'] = datetime.now().strftime('%d %b %Y, %I:%M %p IST')
+                HEALTH.update({'nse_ok': True, 'active_source': 'nse',
+                               'last_live_fetch': datetime.now()})
+                print(f'[INDICES] NSE API OK: {nse_count} indices live')
+            else:
+                HEALTH['nse_ok'] = False
         except Exception as e:
-            print(f'[INDICES] NSE also failed: {e} — using hardcoded defaults')
+            HEALTH['nse_ok'] = False
+            print(f'[INDICES] NSE failed: {e}')
+
+    if defaults['data_source'] == 'fallback':
+        HEALTH['active_source'] = 'fallback'
+        print('[INDICES] WARNING: Both yfinance and NSE failed — using hardcoded defaults')
 
     cache_set('indices', defaults)
     return defaults

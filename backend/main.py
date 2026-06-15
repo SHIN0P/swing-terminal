@@ -14,7 +14,7 @@ _import_errors = []
 try:
     from data_fetcher import (
         get_fii_dii_data, get_indices, get_stock_list,
-        get_stock_history, get_bulk_deals, CACHE,
+        get_stock_history, get_bulk_deals, CACHE, HEALTH, is_market_open,
     )
 except Exception as _e:
     _import_errors.append(f"data_fetcher: {_e}")
@@ -439,6 +439,23 @@ def remove_position(pid: int):
 
 # ── Refresh ───────────────────────────────────────────────────────────────────
 
+@app.get('/api/health')
+def health_check():
+    last_live  = HEALTH.get('last_live_fetch')
+    last_try   = HEALTH.get('last_attempt')
+    return {
+        'status':              'ok',
+        'yfinance_working':    HEALTH.get('yfinance_ok'),
+        'nse_working':         HEALTH.get('nse_ok'),
+        'active_data_source':  HEALTH.get('active_source', 'unknown'),
+        'market_open':         is_market_open(),
+        'last_live_fetch':     last_live.strftime('%d %b %Y, %I:%M %p IST') if last_live else None,
+        'last_fetch_attempt':  last_try.strftime('%d %b %Y, %I:%M %p IST')  if last_try  else None,
+        'cache_entries':       len(CACHE),
+        'import_errors':       _import_errors,
+    }
+
+
 @app.get('/api/refresh')
 def refresh_data():
     CACHE.clear()
@@ -457,6 +474,7 @@ def root():
             '/api/sectors',
             '/api/scanner',
             '/api/opportunities',
+            '/api/health',
             '/api/bulk-deals',
             '/api/portfolio',
             '/api/refresh',

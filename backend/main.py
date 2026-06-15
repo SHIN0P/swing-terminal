@@ -448,6 +448,8 @@ def health_check():
         'yfinance_working':    HEALTH.get('yfinance_ok'),
         'nse_working':         HEALTH.get('nse_ok'),
         'active_data_source':  HEALTH.get('active_source', 'unknown'),
+        'bulk_deals_real':     HEALTH.get('bulk_deals_real'),
+        'fii_dii_real':        HEALTH.get('fii_dii_real'),
         'market_open':         is_market_open(),
         'last_live_fetch':     last_live.strftime('%d %b %Y, %I:%M %p IST') if last_live else None,
         'last_fetch_attempt':  last_try.strftime('%d %b %Y, %I:%M %p IST')  if last_try  else None,

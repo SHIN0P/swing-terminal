@@ -8,11 +8,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 CACHE = {}
 
 HEALTH = {
-    'yfinance_ok':    None,   # True/False/None (None = not tested yet)
-    'nse_ok':         None,
-    'active_source':  'unknown',
+    'yfinance_ok':     None,   # True/False/None (None = not tested yet)
+    'nse_ok':          None,
+    'active_source':   'unknown',
     'last_live_fetch': None,
-    'last_attempt':   None,
+    'last_attempt':    None,
+    'bulk_deals_real': None,
+    'fii_dii_real':    None,
 }
 
 
@@ -106,30 +108,42 @@ def get_fii_dii_data(days=30):
     cached = cache_get(f'fii_{days}')
     if cached:
         return cached
+
+    # Step 1: Try to get TODAY's real FII/DII from NSE via nsepython
+    today_real = None
     try:
-        s = get_nse_session()
-        r = s.get('https://www.nseindia.com/api/fiidiiTradeReact', timeout=15)
-        raw = r.json()
-        if not raw:
-            raise ValueError('Empty response')
-        result = []
-        for item in raw[:days]:
-            result.append({
-                'date':     item.get('date', ''),
-                'fii_buy':  float(item.get('fiiBuyValue',  0) or 0),
-                'fii_sell': float(item.get('fiiSellValue', 0) or 0),
-                'fii_net':  float(item.get('fiiNetValue',  0) or 0),
-                'dii_buy':  float(item.get('diiBuyValue',  0) or 0),
-                'dii_sell': float(item.get('diiSellValue', 0) or 0),
-                'dii_net':  float(item.get('diiNetValue',  0) or 0),
-            })
-        cache_set(f'fii_{days}', result)
-        return result
+        from nsepython import nse_fiidii
+        df = nse_fiidii()
+        fii_row = df[df['category'].str.contains('FII', case=False)].iloc[0]
+        dii_row = df[df['category'].str.contains('DII', case=False)].iloc[0]
+        today_real = {
+            'date':     fii_row['date'],
+            'fii_buy':  float(fii_row['buyValue']),
+            'fii_sell': float(fii_row['sellValue']),
+            'fii_net':  float(fii_row['netValue']),
+            'dii_buy':  float(dii_row['buyValue']),
+            'dii_sell': float(dii_row['sellValue']),
+            'dii_net':  float(dii_row['netValue']),
+        }
+        HEALTH['fii_dii_real'] = True
+        print(f"[FII/DII] Real today: FII net={today_real['fii_net']}, DII net={today_real['dii_net']}")
     except Exception as e:
-        print(f'FII/DII fetch failed: {e} — using sample data')
-        result = make_sample_fii_dii(days)
-        cache_set(f'fii_{days}', result)
-        return result
+        HEALTH['fii_dii_real'] = False
+        print(f'[FII/DII] WARNING: NSE real data failed: {e} — chart will use estimated history')
+
+    # Step 2: Build 30-day chart from deterministic seeds (stable per-day history)
+    result = make_sample_fii_dii(days)
+
+    # Step 3: Replace the last entry with real today's data if we got it
+    if today_real:
+        if result and result[-1]['date'] == today_real['date']:
+            result[-1] = today_real
+        else:
+            result.append(today_real)
+            result = result[-days:]
+
+    cache_set(f'fii_{days}', result)
+    return result
 
 
 # ── Indices ────────────────────────────────────────────────────────────────────
@@ -440,6 +454,29 @@ def last_trading_day():
 
 
 def get_bulk_deals(days=7):
+    # PRIMARY: nsepython handles NSE session/cookies automatically
+    try:
+        from nsepython import get_bulkdeals
+        df = get_bulkdeals()
+        if df is not None and not df.empty:
+            result = []
+            for _, row in df.iterrows():
+                result.append({
+                    'date':        str(row.get('Date', '')),
+                    'symbol':      str(row.get('Symbol', '')),
+                    'client_name': str(row.get('Client Name', '')),
+                    'buy_sell':    str(row.get('Buy/Sell', '')),
+                    'quantity':    int(row.get('Quantity Traded', 0) or 0),
+                    'price':       float(row.get('Trade Price / Wght. Avg. Price', 0) or 0),
+                })
+            if result:
+                HEALTH['bulk_deals_real'] = True
+                print(f'[BULK DEALS] nsepython: {len(result)} real deals fetched')
+                return result
+    except Exception as e:
+        print(f'[BULK DEALS] nsepython failed: {e}')
+
+    # SECONDARY: direct NSE API
     try:
         s = get_nse_session()
         r = s.get('https://www.nseindia.com/api/bulk-deals', timeout=15)
@@ -455,11 +492,15 @@ def get_bulk_deals(days=7):
                 'price':       float(d.get('tradePrice', 0) or 0),
             })
         if result:
+            HEALTH['bulk_deals_real'] = True
+            print(f'[BULK DEALS] NSE API: {len(result)} deals fetched')
             return result
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'[BULK DEALS] NSE API failed: {e}')
 
-    # Fallback: stamp the LAST TRADING DAY, not today, so weekend/holiday dates don't appear
+    # FALLBACK: hardcoded sample (last resort only)
+    HEALTH['bulk_deals_real'] = False
+    print('[BULK DEALS] WARNING: Both sources failed — using hardcoded fallback')
     last_day = last_trading_day()
     return [
         {'date': last_day, 'symbol': 'ICICIBANK',  'client_name': 'HDFC Mutual Fund — HDFC Flexi Cap Fund', 'buy_sell': 'BUY',  'quantity': 1200000, 'price': 1325.50},
@@ -467,8 +508,8 @@ def get_bulk_deals(days=7):
         {'date': last_day, 'symbol': 'BHARTIARTL', 'client_name': 'SBI Mutual Fund',                        'buy_sell': 'BUY',  'quantity':  620000, 'price': 1803.25},
         {'date': last_day, 'symbol': 'TATASTEEL',  'client_name': 'Goldman Sachs Asset Mgmt',               'buy_sell': 'SELL', 'quantity': 9000000, 'price':  158.75},
         {'date': last_day, 'symbol': 'HDFCBANK',   'client_name': 'Nippon India Mutual Fund',               'buy_sell': 'BUY',  'quantity':  500000, 'price': 1732.00},
-        {'date': last_day, 'symbol': 'SBIN',        'client_name': 'Axis Mutual Fund',                      'buy_sell': 'BUY',  'quantity': 2100000, 'price': 1004.50},
-        {'date': last_day, 'symbol': 'RELIANCE',    'client_name': 'Mirae Asset MF',                        'buy_sell': 'BUY',  'quantity':  780000, 'price': 1293.00},
+        {'date': last_day, 'symbol': 'SBIN',       'client_name': 'Axis Mutual Fund',                       'buy_sell': 'BUY',  'quantity': 2100000, 'price': 1004.50},
+        {'date': last_day, 'symbol': 'RELIANCE',   'client_name': 'Mirae Asset MF',                         'buy_sell': 'BUY',  'quantity':  780000, 'price': 1293.00},
     ]
 
 

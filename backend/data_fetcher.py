@@ -165,8 +165,9 @@ _NSE_INDEX_MAP = {
 def _fetch_one_index(ticker):
     """Download one index ticker via yfinance. Returns (last_price, pct_change) or None."""
     import yfinance as yf
-    df = yf.download(ticker, period='5d', interval='1d',
-                     progress=False, auto_adjust=True, timeout=10)
+    # Use Ticker().history() — yf.download() returns MultiIndex columns in v1.4+
+    # which breaks df['Close'] access (returns DataFrame not Series)
+    df = yf.Ticker(ticker).history(period='5d')
     if df.empty:
         return None
     closes = df['Close'].dropna()
@@ -374,20 +375,18 @@ def get_stock_history(symbol, days=90):
     if cached:
         return cached
 
-    # Try yfinance once with a hard 8-second timeout so slow/rate-limited calls
-    # don't stall the entire scanner endpoint.
+    # Use Ticker().history() — yf.download() returns MultiIndex columns in v1.4+
+    # which breaks row['Date'], row['Close'] etc. history() always uses simple columns.
     import yfinance as yf
     yf_sym = symbol if '.NS' in symbol else f'{symbol}.NS'
     try:
-        df = yf.download(yf_sym, period='3mo', interval='1d',
-                         progress=False, auto_adjust=True, timeout=8)
+        df = yf.Ticker(yf_sym).history(period='3mo')
         if df.empty:
             raise ValueError('empty dataframe')
-        df.reset_index(inplace=True)
         result = []
-        for _, row in df.iterrows():
+        for date, row in df.iterrows():
             result.append({
-                'date':   str(row['Date'])[:10],
+                'date':   str(date)[:10],
                 'open':   float(row['Open']),
                 'high':   float(row['High']),
                 'low':    float(row['Low']),

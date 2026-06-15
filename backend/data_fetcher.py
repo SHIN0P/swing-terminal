@@ -38,6 +38,18 @@ def stable_ttl():
     midnight = ist.replace(hour=23, minute=59, second=59, microsecond=0)
     return max(3600, int((midnight - ist).total_seconds()))
 
+
+def scanner_ttl():
+    """
+    Scanner scores refresh at most once per 30 min during market hours.
+    After close: locked until midnight (scores won't change — prices frozen).
+    """
+    if is_market_open():
+        return 1800   # 30 minutes — long enough to be stable, short enough to be useful
+    ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    midnight = ist.replace(hour=23, minute=59, second=59, microsecond=0)
+    return max(3600, int((midnight - ist).total_seconds()))
+
 NSE_HEADERS = {
     'User-Agent': (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '

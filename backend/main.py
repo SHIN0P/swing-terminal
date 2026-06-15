@@ -15,6 +15,7 @@ try:
     from data_fetcher import (
         get_fii_dii_data, get_indices, get_stock_list,
         get_stock_history, get_bulk_deals, CACHE, HEALTH, is_market_open,
+        cache_get, cache_set, scanner_ttl, TOP50_DATA,
     )
 except Exception as _e:
     _import_errors.append(f"data_fetcher: {_e}")
@@ -226,30 +227,50 @@ def sectors_endpoint():
 
 # ── Scanner ───────────────────────────────────────────────────────────────────
 
-@app.get('/api/scanner')
-def scanner_endpoint(min_score: int = 0, sector: str = 'all', limit: int = 50):
-    stocks   = get_stock_list()
+def _build_all_scores():
+    """
+    Score every stock in TOP50_DATA in fixed symbol order and cache the full
+    result list.  Called at most once per scanner_ttl() window so page refreshes
+    never re-derive scores.
+    """
+    cached = cache_get('scanner_all')
+    if cached is not None:
+        return cached
+
+    # Always pull live prices from NSE if available, keyed by symbol.
+    live_prices = {}
+    try:
+        raw = get_stock_list()
+        live_prices = {s.get('symbol', ''): s for s in raw if s.get('symbol')}
+    except Exception:
+        pass
+
+    # Authoritative universe: TOP50_DATA in deterministic order.
+    # Merge live price / pChange / delivery from NSE when available.
+    universe = []
+    for base in TOP50_DATA:
+        sym   = base['symbol']
+        live  = live_prices.get(sym, {})
+        merged = {**base}
+        for field in ('lastPrice', 'pChange', 'deliveryToTradedQuantity'):
+            if live.get(field) is not None:
+                merged[field] = live[field]
+        universe.append(merged)
+
     indices  = get_indices()
     fii_data = get_fii_dii_data(10)
     fii_10d  = sum(d['fii_net'] for d in fii_data)
 
     results = []
-    for stock in stocks[:40]:   # cap at 40 — beyond this yfinance latency kills the request
-        sym          = stock.get('symbol', '')
+    for stock in universe:
+        sym          = stock['symbol']
         stock_sector = stock.get('sector', 'Consumer')
-
-        if sector != 'all' and stock_sector.lower() != sector.lower():
-            continue
-
         idx_key      = SECTOR_INDEX_MAP.get(stock_sector, 'nifty50')
         sector_chg   = indices.get(f'{idx_key}_change', 0)
 
         history = get_stock_history(sym)
         scored  = score_stock(stock, history, fii_10d, sector_chg)
         comp    = scored['composite_score']
-
-        if comp < min_score:
-            continue
 
         ind    = scored['indicators']
         signal, signal_color = get_signal(comp)
@@ -271,39 +292,50 @@ def scanner_endpoint(min_score: int = 0, sector: str = 'all', limit: int = 50):
             'signal_color':      signal_color,
             'rsi':               ind.get('rsi', 50),
             'vol_ratio':         ind.get('vol_ratio', 1.0),
+            'ind':               ind,          # kept for opportunities endpoint
             **levels,
         })
 
     results.sort(key=lambda x: x['composite_score'], reverse=True)
-    return results[:limit]
+    cache_set('scanner_all', results, scanner_ttl())
+    print(f'[SCANNER] Computed {len(results)} scores, cached for {scanner_ttl()}s')
+    return results
+
+
+@app.get('/api/scanner')
+def scanner_endpoint(min_score: int = 0, sector: str = 'all', limit: int = 50):
+    all_results = _build_all_scores()
+
+    filtered = [
+        r for r in all_results
+        if r['composite_score'] >= min_score
+        and (sector == 'all' or r['sector'].lower() == sector.lower())
+    ]
+
+    # Strip internal 'ind' key before returning
+    return [{k: v for k, v in r.items() if k != 'ind'} for r in filtered[:limit]]
 
 
 # ── Opportunities ─────────────────────────────────────────────────────────────
 
 @app.get('/api/opportunities')
 def opportunities_endpoint():
-    stocks   = get_stock_list() 
-    indices  = get_indices()
-    fii_data = get_fii_dii_data(10)
-    fii_10d  = sum(d['fii_net'] for d in fii_data)
+    cached = cache_get('opportunities')
+    if cached is not None:
+        return cached
+
+    all_results = _build_all_scores()
+    indices     = get_indices()
 
     candidates = []
-    for stock in stocks:
-        sym          = stock.get('symbol', '')
-        stock_sector = stock.get('sector', 'Consumer')
-        idx_key      = SECTOR_INDEX_MAP.get(stock_sector, 'nifty50')
-        sector_chg   = indices.get(f'{idx_key}_change', 0)
-
-        history = get_stock_history(sym)
-        scored  = score_stock(stock, history, fii_10d, sector_chg)
-
-        if scored['composite_score'] < 65:
+    for r in all_results:
+        if r['composite_score'] < 65:
             continue
 
-        ind    = scored['indicators']
-        signal, signal_color = get_signal(scored['composite_score'])
-        price  = ind.get('close') or float(stock.get('lastPrice', 0) or 0)
-        levels = get_trade_levels(price, ind.get('atr', price * 0.02), signal)
+        ind          = r.get('ind', {})
+        stock_sector = r['sector']
+        idx_key      = SECTOR_INDEX_MAP.get(stock_sector, 'nifty50')
+        sector_chg   = indices.get(f'{idx_key}_change', 0)
 
         reasons = []
         if ind.get('rsi', 50) < 52 and ind.get('macd_hist', 0) > 0:
@@ -311,10 +343,10 @@ def opportunities_endpoint():
         if ind.get('close', 0) > ind.get('ema20', 0) > ind.get('ema50', 0):
             reasons.append('Price above EMA20 and EMA50 — bullish trend alignment')
         if ind.get('vol_ratio', 1) > 1.5:
-            reasons.append(f"Volume surge {ind.get('vol_ratio', 1):.1f}x average — institutional accumulation")
+            reasons.append(f"Volume surge {ind.get('vol_ratio', 1):.1f}× average — institutional accumulation")
         if ind.get('adx', 0) > 25:
             reasons.append(f"Strong trend strength (ADX {ind.get('adx', 0):.0f}) — trending move underway")
-        if scored['fii_dii_score'] >= 15:
+        if r['fii_dii_score'] >= 15:
             reasons.append('High delivery % — quality institutional holding confirmed')
         if sector_chg > 1.5:
             reasons.append(f"{stock_sector} sector outperforming by {sector_chg:.1f}% today")
@@ -331,23 +363,12 @@ def opportunities_endpoint():
             risks.append('RSI elevated — limited upside before potential consolidation')
 
         candidates.append({
-            'symbol':            sym,
-            'company':           stock.get('companyName', sym),
-            'sector':            stock_sector,
-            'composite_score':   scored['composite_score'],
-            'tech_score':        scored['tech_score'],
-            'fii_dii_score':     scored['fii_dii_score'],
-            'fundamental_score': scored['fundamental_score'],
-            'sector_score':      scored['sector_score'],
-            'signal':            signal,
-            'signal_color':      signal_color,
-            'rsi':               ind.get('rsi', 50),
-            'reasons':           reasons[:4],
-            'risks':             risks[:3],
-            **levels,
+            **{k: v for k, v in r.items() if k != 'ind'},
+            'reasons': reasons[:4],
+            'risks':   risks[:3],
         })
 
-    candidates.sort(key=lambda x: x['composite_score'], reverse=True)
+    cache_set('opportunities', candidates, scanner_ttl())
     return candidates[:15]
 
 
@@ -460,8 +481,12 @@ def health_check():
 
 @app.get('/api/refresh')
 def refresh_data():
-    CACHE.clear()
-    return {'message': 'Cache cleared', 'timestamp': time.time()}
+    # Clear only volatile top-level caches so scores re-derive from fresh index
+    # data.  Do NOT clear hist_* entries — those are stable and expensive to
+    # rebuild, and wiping them would cause a 40-stock yfinance burst on next load.
+    for key in ('indices', 'scanner_all', 'opportunities', 'fii_10', 'fii_20', 'fii_30'):
+        CACHE.pop(key, None)
+    return {'message': 'Refreshed index + score caches', 'timestamp': time.time()}
 
 
 @app.get('/')

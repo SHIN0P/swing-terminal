@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react'
 import Loader from '../components/Loader'
 import ScoreGauge from '../components/ScoreGauge'
+import PositionSizeBox from '../components/PositionSizeBox'
+import RiskOffWarning from '../components/RiskOffWarning'
 import { getOpportunities } from '../services/api'
 
 const SIG_CLS = {
@@ -94,11 +96,14 @@ function OpCard({ op, index }) {
       </div>
 
       <div style={{ borderTop: '1px solid #0F1318', paddingTop: 8 }}>
-        <ScoreBar label="TECHNICAL"   value={op.tech_score || 0}       max={40} />
-        <ScoreBar label="FII / DII"   value={op.fii_dii_score || 0}    max={25} />
-        <ScoreBar label="FUNDAMENTAL" value={op.fundamental_score || 0} max={20} />
-        <ScoreBar label="SECTOR"      value={op.sector_score || 0}      max={15} />
+        <ScoreBar label="TECHNICAL"         value={op.indicator_score || 0}         max={20} />
+        <ScoreBar label="RELATIVE STRENGTH" value={op.relative_strength_score || 0} max={20} />
+        <ScoreBar label="FII / DII"         value={op.fii_dii_score || 0}            max={25} />
+        <ScoreBar label="FUNDAMENTAL"       value={op.fundamental_score || 0}        max={20} />
+        <ScoreBar label="SECTOR"            value={op.sector_score || 0}             max={15} />
       </div>
+
+      <PositionSizeBox ps={op.position_size} net={op.net_profit_target1} />
 
       <button onClick={() => setExpanded(!expanded)} style={{
         width: '100%', background: 'none', border: '1px solid #0F1318',
@@ -156,6 +161,8 @@ export default function SwingOpportunities() {
   return (
     <div>
       <Loader isLoading={loading} />
+
+      <RiskOffWarning />
 
       <div style={{ marginBottom: 16 }}>
         <div style={{ fontSize: 8, color: '#00E5A0', letterSpacing: 3, fontWeight: 700, marginBottom: 2 }}>SWING SETUPS</div>

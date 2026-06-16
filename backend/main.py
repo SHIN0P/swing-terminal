@@ -2,7 +2,8 @@ import os
 import time
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -21,6 +22,7 @@ try:
         disk_cache_get, disk_cache_set, disk_cache_clear_today,
         get_today_str, CACHE_DIR,
         get_sector_index_changes, get_data_quality, get_price_source,
+        get_market_regime, get_relative_strength_map,
     )
 except Exception as _e:
     _import_errors.append(f"data_fetcher: {_e}")
@@ -33,7 +35,10 @@ except Exception as _e:
     traceback.print_exc()
 
 try:
-    from scorer import score_stock, get_signal, get_trade_levels
+    from scorer import (
+        score_stock, get_signal, get_trade_levels,
+        compute_position_size, compute_net_pnl,
+    )
 except Exception as _e:
     _import_errors.append(f"scorer: {_e}")
     traceback.print_exc()
@@ -41,7 +46,7 @@ except Exception as _e:
 try:
     from database import (
         get_portfolio, add_to_portfolio, delete_from_portfolio,
-        update_portfolio_price,
+        update_portfolio_price, get_settings, update_settings,
     )
 except Exception as _e:
     _import_errors.append(f"database: {_e}")
@@ -76,6 +81,25 @@ SECTOR_INDEX_MAP = {
     'Finance':  'nifty_bank',
     'Consumer': 'nifty_fmcg',
 }
+
+SYMBOL_SECTOR_MAP = {s['symbol']: s.get('sector', 'Other') for s in TOP50_DATA}
+
+
+def _trading_days_since(iso_date_str: str) -> int:
+    """Approximate trading (Mon-Fri) days elapsed since an ISO timestamp.
+    Doesn't account for exchange holidays — close enough for a 10-day time stop."""
+    try:
+        start = datetime.fromisoformat(iso_date_str).date()
+    except Exception:
+        return 0
+    end = datetime.now().date()
+    days = 0
+    d = start
+    while d < end:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            days += 1
+    return days
 
 
 # ── Market Pulse ──────────────────────────────────────────────────────────────
@@ -132,6 +156,37 @@ def market_pulse():
         'last_data_update':  last_update,
         'data_source':       indices.get('data_source', 'fallback'),
     }
+
+
+# ── Market Regime Gate (Layer 1) ─────────────────────────────────────────────
+
+REGIME_COLORS = {'RISK-ON': '#00E5A0', 'NEUTRAL': '#FFB020', 'RISK-OFF': '#FF455A'}
+
+
+@app.get('/api/regime')
+def regime_endpoint():
+    regime = get_market_regime()
+    return {
+        **regime,
+        'color': REGIME_COLORS.get(regime['regime'], '#4D9FFF'),
+    }
+
+
+# ── Risk Settings (Layer 4 — capital & risk-per-trade) ───────────────────────
+
+class SettingsUpdate(BaseModel):
+    capital:  Optional[float] = None
+    risk_pct: Optional[float] = None
+
+
+@app.get('/api/settings')
+def settings_get():
+    return get_settings()
+
+
+@app.post('/api/settings')
+def settings_post(body: SettingsUpdate):
+    return update_settings(capital=body.capital, risk_pct=body.risk_pct)
 
 
 # ── FII / DII ─────────────────────────────────────────────────────────────────
@@ -314,6 +369,7 @@ def _build_all_scores():
     fii_data = get_fii_dii_data(10)
     fii_10d  = sum(d['fii_net'] for d in fii_data)
     ts       = _ist_now_str()
+    rs_map   = get_relative_strength_map()   # Layer 3 — 50d return vs Nifty, ranked
 
     results = []
     for stock in universe:
@@ -321,9 +377,11 @@ def _build_all_scores():
         stock_sector = stock.get('sector', 'Consumer')
         idx_key      = SECTOR_INDEX_MAP.get(stock_sector, 'nifty50')
         sector_chg   = indices.get(f'{idx_key}_change', 0)
+        rs_entry     = rs_map.get(sym, {})
+        rs_score     = rs_entry.get('rs_score', 0)
 
         history = get_stock_history(sym)
-        scored  = score_stock(stock, history, fii_10d, sector_chg)
+        scored  = score_stock(stock, history, fii_10d, sector_chg, rs_score)
         comp    = scored['composite_score']
         ind     = scored['indicators']
         signal, signal_color = get_signal(comp)
@@ -333,23 +391,27 @@ def _build_all_scores():
         price_src = get_price_source(sym)
 
         results.append({
-            'symbol':            sym,
-            'company':           stock.get('companyName', sym),
-            'sector':            stock_sector,
-            'price':             price,
-            'price_source':      'live' if price_src == 'yfinance' else 'estimated',
-            'change_pct':        float(stock.get('pChange', 0) or 0),
-            'composite_score':   comp,
-            'tech_score':        scored['tech_score'],
-            'fii_dii_score':     scored['fii_dii_score'],
-            'fundamental_score': scored['fundamental_score'],
-            'sector_score':      scored['sector_score'],
-            'signal':            signal,
-            'signal_color':      signal_color,
-            'rsi':               ind.get('rsi', 50),
-            'vol_ratio':         ind.get('vol_ratio', 1.0),
-            'data_timestamp':    ts,
-            'ind':               ind,   # kept internally; stripped before API response
+            'symbol':                  sym,
+            'company':                 stock.get('companyName', sym),
+            'sector':                  stock_sector,
+            'price':                   price,
+            'price_source':            'live' if price_src == 'yfinance' else 'estimated',
+            'change_pct':              float(stock.get('pChange', 0) or 0),
+            'composite_score':         comp,
+            'tech_score':              scored['tech_score'],
+            'indicator_score':         scored['indicator_score'],
+            'relative_strength_score': scored['relative_strength_score'],
+            'stock_return_50d':        rs_entry.get('stock_return_50d'),
+            'nifty_return_50d':        rs_entry.get('nifty_return_50d'),
+            'fii_dii_score':           scored['fii_dii_score'],
+            'fundamental_score':       scored['fundamental_score'],
+            'sector_score':            scored['sector_score'],
+            'signal':                  signal,
+            'signal_color':            signal_color,
+            'rsi':                     ind.get('rsi', 50),
+            'vol_ratio':               ind.get('vol_ratio', 1.0),
+            'data_timestamp':          ts,
+            'ind':                     ind,   # kept internally; stripped before API response
             **levels,
         })
 
@@ -367,6 +429,20 @@ def _public(r: dict) -> dict:
     return {k: v for k, v in r.items() if k != 'ind'}
 
 
+def _add_position_sizing(r: dict, settings: dict) -> dict:
+    """
+    Layer 4 + Layer 9 — applied at request time (NOT baked into the
+    disk-cached score), so changing your saved capital/risk% in Settings
+    is reflected immediately without invalidating the whole day's scores.
+    """
+    sizing = compute_position_size(
+        settings['capital'], settings['risk_pct'], r['price'], r['stop_loss'],
+    )
+    gross_t1 = round(sizing['shares'] * (r['target_1'] - r['price']), 2)
+    net_t1   = compute_net_pnl(gross_t1, sizing['position_value'])
+    return {**r, 'position_size': sizing, 'net_profit_target1': net_t1}
+
+
 @app.get('/api/scanner')
 def scanner_endpoint(min_score: int = 0, sector: str = 'all', limit: int = 50):
     all_results = _build_all_scores()
@@ -375,20 +451,24 @@ def scanner_endpoint(min_score: int = 0, sector: str = 'all', limit: int = 50):
         if r['composite_score'] >= min_score
         and (sector == 'all' or r['sector'].lower() == sector.lower())
     ]
-    return filtered[:limit]
+    settings = get_settings()
+    return [_add_position_sizing(r, settings) for r in filtered[:limit]]
 
 
 # ── Opportunities ─────────────────────────────────────────────────────────────
 
 @app.get('/api/opportunities')
 def opportunities_endpoint():
-    # Check disk cache directly (same daily file as scores)
-    disk_payload = disk_cache_get('scores')
-    if disk_payload is not None:
-        mem_opps = cache_get('opportunities')
-        if mem_opps is not None:
-            return mem_opps
+    candidates = cache_get('opportunities')
+    if candidates is None:
+        candidates = _build_opportunity_candidates()
+        cache_set('opportunities', candidates, scanner_ttl())
 
+    settings = get_settings()
+    return [_add_position_sizing(c, settings) for c in candidates[:15]]
+
+
+def _build_opportunity_candidates():
     all_results = _build_all_scores()
     indices     = get_indices()
 
@@ -415,15 +495,23 @@ def opportunities_endpoint():
             reasons.append('High delivery % — quality institutional holding confirmed')
         if sector_chg > 1.5:
             reasons.append(f"{stock_sector} sector outperforming by {sector_chg:.1f}% today")
+        if r.get('relative_strength_score', 0) >= 20:
+            reasons.append(
+                f"Top-quartile relative strength — {r['stock_return_50d']:.1f}% (50d) vs "
+                f"Nifty's {r['nifty_return_50d']:.1f}%"
+            )
+        elif r.get('relative_strength_score', 0) >= 10:
+            reasons.append(f"Outperforming Nifty over 50 days ({r['stock_return_50d']:.1f}% vs {r['nifty_return_50d']:.1f}%)")
         if not reasons:
             reasons.append('Multiple technical signals aligning for swing trade setup')
-            reasons.append('Strong relative strength vs Nifty 50')
 
         risks = ['Stop loss breach invalidates setup — exit immediately',
                  'Nifty 50 breakdown below key support could drag stock down',
                  'Global cues: US Fed decisions or FII risk-off events']
         if ind.get('rsi', 50) > 65:
             risks.append('RSI elevated — limited upside before potential consolidation')
+        if r.get('relative_strength_score', 0) == 0:
+            risks.append('Underperforming Nifty over the last 50 days — momentum case is weak')
 
         candidates.append({
             **_public(r),
@@ -431,8 +519,7 @@ def opportunities_endpoint():
             'risks':   risks[:3],
         })
 
-    cache_set('opportunities', candidates, scanner_ttl())
-    return candidates[:15]
+    return candidates
 
 
 # ── Bulk Deals ────────────────────────────────────────────────────────────────
@@ -444,15 +531,23 @@ def bulk_deals_endpoint(days: int = 7):
 
 # ── Portfolio ─────────────────────────────────────────────────────────────────
 
+MAX_OPEN_POSITIONS           = 12
+MAX_SECTOR_CONCENTRATION_PCT = 30.0
+TIME_STOP_TRADING_DAYS       = 10
+
+
 @app.get('/api/portfolio')
 def portfolio_endpoint():
     positions  = get_portfolio()
     stocks     = get_stock_list()
     price_map  = {s['symbol']: float(s.get('lastPrice', 0) or 0) for s in stocks}
+    settings   = get_settings()
 
-    enriched        = []
-    total_invested  = 0.0
-    total_current   = 0.0
+    enriched       = []
+    total_invested = 0.0
+    total_current  = 0.0
+    total_risk     = 0.0
+    sector_value   = {}
 
     for pos in positions:
         sym     = pos['symbol']
@@ -474,18 +569,62 @@ def portfolio_endpoint():
         elif current < ep * 0.97:                status = 'REVIEW'
         else:                                    status = 'ON TRACK'
 
+        # ── Layer 6: Time Stop ──────────────────────────────────────────────
+        days_held    = _trading_days_since(pos['added_at'])
+        time_stop    = days_held >= TIME_STOP_TRADING_DAYS and pnl <= 0
+        breakeven_trigger = round(ep + (ep - sl), 2) if ep > sl else None
+        at_breakeven      = breakeven_trigger is not None and current >= breakeven_trigger
+
+        # ── Layer 9: real take-home if exited now ───────────────────────────
+        net = compute_net_pnl(pnl, current_val)
+
+        sector = SYMBOL_SECTOR_MAP.get(sym, 'Other')
+        sector_value[sector] = sector_value.get(sector, 0) + current_val
+        still_open = status not in ('EXIT', 'TARGET HIT')
+        if still_open:
+            total_risk += max(0.0, ep - sl) * pos['quantity']
+
         enriched.append({
             **pos,
-            'current_price': round(current, 2),
-            'pnl':           round(pnl, 2),
-            'pnl_pct':       round(pnl_pct, 2),
-            'invested':      round(invested, 2),
-            'current_value': round(current_val, 2),
-            'status':        status,
+            'current_price':     round(current, 2),
+            'pnl':                round(pnl, 2),
+            'pnl_pct':            round(pnl_pct, 2),
+            'invested':           round(invested, 2),
+            'current_value':      round(current_val, 2),
+            'status':             status,
+            'sector':             sector,
+            'days_held':          days_held,
+            'time_stop':          time_stop,
+            'breakeven_trigger':  breakeven_trigger,
+            'at_breakeven':       at_breakeven,
+            'trail_note':         'At +1R move stop to breakeven',
+            'net_pnl':            net['net_pnl'],
+            'net_pnl_breakdown':  net,
         })
 
     total_pnl     = total_current - total_invested
     total_pnl_pct = (total_pnl / total_invested * 100) if total_invested > 0 else 0
+
+    # ── Layer 7: Portfolio Limits ────────────────────────────────────────────
+    warnings   = []
+    open_count = sum(1 for e in enriched if e['status'] not in ('EXIT', 'TARGET HIT'))
+    if open_count > MAX_OPEN_POSITIONS:
+        warnings.append(f'Too many positions ({open_count}/{MAX_OPEN_POSITIONS}) — risk is spread too thin to manage well')
+
+    sector_breakdown    = []
+    largest_sector_pct  = 0.0
+    largest_sector_name = None
+    if total_current > 0:
+        for sec, val in sorted(sector_value.items(), key=lambda x: -x[1]):
+            pct = round(val / total_current * 100, 1)
+            sector_breakdown.append({'sector': sec, 'value': round(val, 2), 'pct': pct})
+            if pct > largest_sector_pct:
+                largest_sector_pct, largest_sector_name = pct, sec
+            if pct > MAX_SECTOR_CONCENTRATION_PCT:
+                warnings.append(f'Over-concentrated in {sec} ({pct}% of portfolio) — diversify')
+
+    capital             = settings['capital']
+    risk_pct_of_capital  = round(total_risk / capital * 100, 2) if capital > 0 else 0
 
     return {
         'positions': enriched,
@@ -494,6 +633,17 @@ def portfolio_endpoint():
             'total_current':  round(total_current,  2),
             'total_pnl':      round(total_pnl,      2),
             'total_pnl_pct':  round(total_pnl_pct,  2),
+        },
+        'health': {
+            'open_positions':      open_count,
+            'max_positions':       MAX_OPEN_POSITIONS,
+            'sector_breakdown':    sector_breakdown,
+            'largest_sector':      largest_sector_name,
+            'largest_sector_pct':  largest_sector_pct,
+            'total_risk_exposure': round(total_risk, 2),
+            'risk_pct_of_capital': risk_pct_of_capital,
+            'capital':             capital,
+            'warnings':            warnings,
         },
     }
 

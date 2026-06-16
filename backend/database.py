@@ -27,8 +27,48 @@ def init_db():
             status       TEXT    DEFAULT 'ON TRACK'
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    ''')
     conn.commit()
     conn.close()
+
+
+# ── Risk settings (capital + risk-per-trade %) — Layer 4 ────────────────────
+DEFAULT_SETTINGS = {'capital': '100000', 'risk_pct': '0.75'}
+
+
+def get_settings():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT key, value FROM settings')
+    stored = {r['key']: r['value'] for r in cursor.fetchall()}
+    conn.close()
+    merged = {**DEFAULT_SETTINGS, **stored}
+    return {'capital': float(merged['capital']), 'risk_pct': float(merged['risk_pct'])}
+
+
+def update_settings(capital=None, risk_pct=None):
+    conn = get_connection()
+    cursor = conn.cursor()
+    if capital is not None:
+        cursor.execute(
+            'INSERT INTO settings (key, value) VALUES (?, ?) '
+            'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+            ('capital', str(capital)),
+        )
+    if risk_pct is not None:
+        cursor.execute(
+            'INSERT INTO settings (key, value) VALUES (?, ?) '
+            'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+            ('risk_pct', str(risk_pct)),
+        )
+    conn.commit()
+    conn.close()
+    return get_settings()
 
 
 def get_portfolio():

@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import Loader from '../components/Loader'
 import SectorHeatmap from '../components/SectorHeatmap'
 import ScoreGauge from '../components/ScoreGauge'
+import RegimeBanner from '../components/RegimeBanner'
 import { getMarketPulse, getSectors, getOpportunities } from '../services/api'
 
 const FMT  = (v, d = 2) => (v || 0).toLocaleString('en-IN', { maximumFractionDigits: d })
@@ -80,6 +81,8 @@ export default function Dashboard() {
   return (
     <div>
       <Loader isLoading={loading} />
+
+      <RegimeBanner />
 
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 18 }}>
         <div>

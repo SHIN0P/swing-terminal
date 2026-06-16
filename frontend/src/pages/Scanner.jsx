@@ -1,5 +1,7 @@
 import { useState, useEffect, useMemo } from 'react'
 import Loader from '../components/Loader'
+import PositionSizeBox from '../components/PositionSizeBox'
+import RiskOffWarning from '../components/RiskOffWarning'
 import { getScanner } from '../services/api'
 
 const SECTORS = ['all', 'Banking', 'IT', 'Pharma', 'Auto', 'FMCG', 'Metal', 'Realty', 'Energy', 'Telecom', 'Infra', 'Finance']
@@ -61,6 +63,8 @@ export default function Scanner() {
   return (
     <div>
       <Loader isLoading={loading} />
+
+      <RiskOffWarning />
 
       <div style={{ marginBottom: 16 }}>
         <div style={{ fontSize: 8, color: '#00E5A0', letterSpacing: 3, fontWeight: 700, marginBottom: 2 }}>STOCK SCANNER</div>
@@ -174,12 +178,21 @@ export default function Scanner() {
                     <tr key={`${s.symbol}-exp`}>
                       <td colSpan={12} style={{ padding: '12px 16px', background: 'rgba(0,229,160,0.03)', borderBottom: '1px solid #0F1318' }}>
                         <div style={{ fontSize: 8, color: '#2A3040', marginBottom: 8, letterSpacing: 2, fontWeight: 700 }}>SCORE BREAKDOWN</div>
-                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16 }}>
-                          <ScoreBar label="TECHNICAL" value={s.tech_score || 0} max={40} />
-                          <ScoreBar label="FII / DII"  value={s.fii_dii_score || 0} max={25} />
-                          <ScoreBar label="FUNDAMENTAL" value={s.fundamental_score || 0} max={20} />
-                          <ScoreBar label="SECTOR"     value={s.sector_score || 0} max={15} />
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 16, marginBottom: 14 }}>
+                          <ScoreBar label="TECHNICAL"          value={s.indicator_score || 0}         max={20} />
+                          <ScoreBar label="RELATIVE STRENGTH"  value={s.relative_strength_score || 0} max={20} />
+                          <ScoreBar label="FII / DII"          value={s.fii_dii_score || 0}            max={25} />
+                          <ScoreBar label="FUNDAMENTAL"        value={s.fundamental_score || 0}        max={20} />
+                          <ScoreBar label="SECTOR"             value={s.sector_score || 0}             max={15} />
                         </div>
+                        {s.stock_return_50d != null && (
+                          <div style={{ fontSize: 9, color: '#4B5563', marginBottom: 12 }}>
+                            50D return: <span className="num" style={{ color: s.stock_return_50d >= (s.nifty_return_50d ?? 0) ? '#00E5A0' : '#FF455A' }}>
+                              {s.stock_return_50d >= 0 ? '+' : ''}{s.stock_return_50d.toFixed(1)}%
+                            </span> vs Nifty <span className="num">{s.nifty_return_50d != null ? `${s.nifty_return_50d >= 0 ? '+' : ''}${s.nifty_return_50d.toFixed(1)}%` : '—'}</span>
+                          </div>
+                        )}
+                        <PositionSizeBox ps={s.position_size} net={s.net_profit_target1} target1={s.target_1} />
                       </td>
                     </tr>
                   )}

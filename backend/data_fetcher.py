@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 import requests
 import time
@@ -555,6 +556,172 @@ def get_sector_index_changes():
     cache_set('sector_index_changes', results, stable_ttl())
     print(f'[SECTOR CHANGES] real 5d/20d computed for {len(results)}/{len(_YF_INDEX_MAP)} indices')
     return results
+
+
+# ── Market Regime Gate (Layer 1) + Relative Strength (Layer 3) ──────────────────
+# Both need a real daily close series for Nifty 50, so they share one fetch.
+
+def get_index_daily_closes(ticker='^NSEI', period='6mo'):
+    """Real daily closes for an index — used for the 50DMA regime check and
+    for ranking stocks' relative strength against Nifty."""
+    cache_key = f'idx_hist_{ticker}'
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        import yfinance as yf
+        df = yf.Ticker(ticker).history(period=period)
+        closes = df['Close'].dropna()
+        result = [round(float(c), 2) for c in closes.tolist()]
+    except Exception as e:
+        print(f'[REGIME] Failed to fetch {ticker} history: {e}')
+        result = []
+    cache_set(cache_key, result, stable_ttl())
+    return result
+
+
+def _compute_breadth():
+    """% of the TOP50_DATA universe currently trading above their own 50DMA."""
+    above, total = 0, 0
+    for stock in TOP50_DATA:
+        hist = get_stock_history(stock['symbol'])
+        if not hist or len(hist) < 50:
+            continue
+        closes = [r['close'] for r in hist[-50:]]
+        dma50  = sum(closes) / len(closes)
+        total += 1
+        if hist[-1]['close'] > dma50:
+            above += 1
+    if total == 0:
+        return None
+    return round(above / total * 100, 1)
+
+
+def get_market_regime():
+    """
+    Layer 1 — Market Regime Gate.
+      RISK-ON:  Nifty > 50DMA AND 50DMA rising            → full size
+      NEUTRAL:  Nifty > 50DMA but flat/choppy, OR breadth
+                drops below 40% even with a healthy index → half size
+      RISK-OFF: Nifty < 50DMA and falling                 → no new longs
+    """
+    cached = cache_get('market_regime')
+    if cached is not None:
+        return cached
+
+    closes = get_index_daily_closes('^NSEI', period='6mo')
+    if len(closes) < 56:
+        result = {
+            'regime':       'NEUTRAL',
+            'label':        'Half size, fewer positions',
+            'nifty_price':  closes[-1] if closes else None,
+            'dma_50':       None,
+            'above_dma':    None,
+            'dma_rising':   None,
+            'breadth_pct':  None,
+            'breadth_downgrade': False,
+            'reason':       'Insufficient Nifty history to compute 50DMA — defaulting to caution',
+            'data_quality': 'estimated',
+        }
+        cache_set('market_regime', result, stable_ttl())
+        return result
+
+    dma_series  = [sum(closes[i - 49:i + 1]) / 50 for i in range(49, len(closes))]
+    dma_today   = dma_series[-1]
+    dma_5ago    = dma_series[-6] if len(dma_series) > 5 else dma_today
+    nifty_price = closes[-1]
+    above_dma   = nifty_price > dma_today
+    dma_rising  = dma_today > dma_5ago
+
+    breadth_pct = _compute_breadth()
+
+    if above_dma and dma_rising:
+        regime, label = 'RISK-ON', 'Full position sizing allowed'
+    elif (not above_dma) and (not dma_rising):
+        regime, label = 'RISK-OFF', 'No new longs — manage existing only'
+    else:
+        regime, label = 'NEUTRAL', 'Half size, fewer positions'
+
+    downgraded = False
+    if regime == 'RISK-ON' and breadth_pct is not None and breadth_pct < 40:
+        regime, label = 'NEUTRAL', 'Half size, fewer positions (weak breadth)'
+        downgraded = True
+
+    result = {
+        'regime':            regime,
+        'label':             label,
+        'nifty_price':       round(nifty_price, 2),
+        'dma_50':            round(dma_today, 2),
+        'above_dma':         above_dma,
+        'dma_rising':        dma_rising,
+        'breadth_pct':       breadth_pct,
+        'breadth_downgrade': downgraded,
+        'data_quality':      'live',
+    }
+    cache_set('market_regime', result, scanner_ttl())
+    print(f"[REGIME] {regime} — Nifty {nifty_price:.0f} vs 50DMA {dma_today:.0f} "
+          f"(rising={dma_rising}), breadth={breadth_pct}%")
+    return result
+
+
+def get_relative_strength_map():
+    """
+    Layer 3 — each stock's 50-day return vs Nifty's 50-day return.
+      beats Nifty AND top 25% of all beaters → 20 pts
+      beats Nifty, mid-pack                  → 10 pts
+      underperforms Nifty                    → 0 pts
+    Returns {symbol: {'rs_score', 'stock_return_50d', 'nifty_return_50d'}}.
+    """
+    cached = cache_get('relative_strength_map')
+    if cached is not None:
+        return cached
+
+    nifty_closes = get_index_daily_closes('^NSEI', period='6mo')
+    nifty_ret = None
+    if len(nifty_closes) >= 51 and nifty_closes[-51]:
+        nifty_ret = (nifty_closes[-1] - nifty_closes[-51]) / nifty_closes[-51] * 100
+
+    stock_returns = {}
+    for stock in TOP50_DATA:
+        sym  = stock['symbol']
+        hist = get_stock_history(sym)
+        if hist and len(hist) >= 51 and hist[-51]['close']:
+            c0, c1 = hist[-51]['close'], hist[-1]['close']
+            stock_returns[sym] = round((c1 - c0) / c0 * 100, 2)
+        else:
+            stock_returns[sym] = None
+
+    result = {}
+    if nifty_ret is None:
+        for sym, ret in stock_returns.items():
+            result[sym] = {'rs_score': 0, 'stock_return_50d': ret, 'nifty_return_50d': None}
+        cache_set('relative_strength_map', result, scanner_ttl())
+        return result
+
+    beaters = sorted(
+        [(sym, ret) for sym, ret in stock_returns.items() if ret is not None and ret > nifty_ret],
+        key=lambda x: -x[1],
+    )
+    cutoff = max(1, math.ceil(len(beaters) * 0.25)) if beaters else 0
+    top25  = {sym for sym, _ in beaters[:cutoff]}
+
+    for sym, ret in stock_returns.items():
+        if ret is None or ret <= nifty_ret:
+            rs_score = 0
+        elif sym in top25:
+            rs_score = 20
+        else:
+            rs_score = 10
+        result[sym] = {
+            'rs_score':         rs_score,
+            'stock_return_50d': ret,
+            'nifty_return_50d': round(nifty_ret, 2),
+        }
+
+    cache_set('relative_strength_map', result, scanner_ttl())
+    print(f'[RELATIVE STRENGTH] Nifty 50d return={nifty_ret:.2f}% — '
+          f'{len(beaters)}/{len(stock_returns)} stocks beating it, top25 cutoff={cutoff}')
+    return result
 
 
 # ── Stock list ─────────────────────────────────────────────────────────────────

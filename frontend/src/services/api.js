@@ -36,7 +36,7 @@ export const getBulkDeals = (days = 7) =>
   safe(() => client.get(`/api/bulk-deals?days=${days}`), [])
 
 export const getPortfolio = () =>
-  safe(() => client.get('/api/portfolio'), { positions: [], summary: {} })
+  safe(() => client.get('/api/portfolio'), { positions: [], summary: {}, health: {} })
 
 export const addPosition = (data) =>
   safe(() => client.post('/api/portfolio', data), null)
@@ -46,3 +46,15 @@ export const deletePosition = (id) =>
 
 export const triggerRefresh = () =>
   safe(() => client.get('/api/refresh'), null)
+
+export const getRegime = () =>
+  safe(() => client.get('/api/regime'), {
+    regime: 'NEUTRAL', label: 'Loading...', color: '#4D9FFF',
+    nifty_price: null, dma_50: null, breadth_pct: null,
+  })
+
+export const getSettings = () =>
+  safe(() => client.get('/api/settings'), { capital: 100000, risk_pct: 0.75 })
+
+export const updateSettings = (data) =>
+  safe(() => client.post('/api/settings', data), null)

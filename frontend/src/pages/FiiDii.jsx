@@ -27,14 +27,15 @@ const ChartTip = ({ active, payload, label }) => {
 }
 
 function MetricCard({ label, value, pos, delay = 0 }) {
+  const unavailable = value == null
   return (
     <div className="card-entrance hud-panel" style={{ padding: '12px 14px', animationDelay: `${delay}s` }}>
       <div style={{ fontSize: 8, color: '#4B5563', letterSpacing: 2, marginBottom: 6, fontWeight: 700 }}>{label}</div>
-      <div style={{ fontSize: 16, fontWeight: 700, color: pos ? '#00E5A0' : '#FF455A' }} className="num">
-        {value < 0 ? '' : ''}₹{FMT(Math.abs(value || 0))} Cr
+      <div style={{ fontSize: 16, fontWeight: 700, color: unavailable ? '#2A3040' : (pos ? '#00E5A0' : '#FF455A') }} className="num">
+        {unavailable ? 'N/A' : `₹${FMT(Math.abs(value))} Cr`}
       </div>
       <div style={{ fontSize: 8, color: '#2A3040', marginTop: 3, letterSpacing: 1 }}>
-        {pos ? '▲ INFLOW' : '▼ OUTFLOW'}
+        {unavailable ? 'NO REAL DATA YET' : (pos ? '▲ INFLOW' : '▼ OUTFLOW')}
       </div>
     </div>
   )
@@ -56,9 +57,14 @@ export default function FiiDii() {
 
   const daily   = data?.daily_data || []
   const recent  = daily.slice(0, 5)
-  const fii_buy_avg  = recent.reduce((a, d) => a + (d.fii_buy  || 0), 0) / (recent.length || 1)
-  const fii_sell_avg = recent.reduce((a, d) => a + (d.fii_sell || 0), 0) / (recent.length || 1)
-  const fii_net_5d   = recent.reduce((a, d) => a + (d.fii_net  || 0), 0)
+  // Buy/sell breakdown is only real for days nse_fiidii() was captured live
+  // (source: 'nse_real'). Older backfilled days are net-only — average only
+  // over days that actually have a real buy/sell figure rather than
+  // silently treating missing data as zero.
+  const withBuySell  = recent.filter(d => d.fii_buy != null)
+  const fii_buy_avg  = withBuySell.length ? withBuySell.reduce((a, d) => a + d.fii_buy,  0) / withBuySell.length : null
+  const fii_sell_avg = withBuySell.length ? withBuySell.reduce((a, d) => a + d.fii_sell, 0) / withBuySell.length : null
+  const fii_net_5d   = recent.reduce((a, d) => a + (d.fii_net  || 0), 0)  // net is always real
 
   const chartData = [...daily].slice(0, days).reverse().map(d => ({
     date: d.date?.slice(0, 6) || '',

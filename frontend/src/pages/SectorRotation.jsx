@@ -9,7 +9,21 @@ const PHASE_INFO = {
   Slowdown:       { desc: 'FMCG, Telecom, defensives',    color: '#FF455A', sectors: ['FMCG', 'Telecom'] },
 }
 
-const CURRENT_PHASE = 'Late Expansion'
+// Real computation, not a hardcoded guess: whichever phase's constituent
+// sectors currently have the highest average live score wins. Falls back
+// to null (no phase highlighted) until sector data has loaded.
+function computeCurrentPhase(sectors) {
+  if (!sectors.length) return null
+  const byName = Object.fromEntries(sectors.map(s => [s.name, s]))
+  let best = null, bestAvg = -Infinity
+  for (const [phase, info] of Object.entries(PHASE_INFO)) {
+    const scores = info.sectors.map(n => byName[n]?.score).filter(v => v != null)
+    if (!scores.length) continue
+    const avg = scores.reduce((a, v) => a + v, 0) / scores.length
+    if (avg > bestAvg) { bestAvg = avg; best = phase }
+  }
+  return best
+}
 
 export default function SectorRotation() {
   const [sectors, setSectors]   = useState([])
@@ -25,6 +39,8 @@ export default function SectorRotation() {
     }
     load()
   }, [])
+
+  const CURRENT_PHASE = computeCurrentPhase(sectors)
 
   const toggleSort = (key) => {
     if (sortKey === key) setSortAsc(a => !a)
@@ -121,10 +137,19 @@ export default function SectorRotation() {
                 return (
                   <tr key={s.name} className="data-row" style={{ borderLeft: `2px solid ${accent}` }}>
                     <td style={{ padding: '8px 10px', color: '#2A3040', fontSize: 10 }}>{i + 1}</td>
-                    <td style={{ padding: '8px 10px', color: '#C8D0DC', fontWeight: 600 }}>{s.name}</td>
+                    <td style={{ padding: '8px 10px', color: '#C8D0DC', fontWeight: 600 }}>
+                      {s.name}
+                      {s.data_quality === 'estimated' && (
+                        <span style={{
+                          marginLeft: 5, fontSize: 7, fontWeight: 700, letterSpacing: 0.5,
+                          color: '#FFB020', border: '1px solid rgba(255,176,32,0.3)',
+                          borderRadius: 2, padding: '1px 3px', verticalAlign: 'middle',
+                        }} title="yfinance unreachable for this index — 5D/20D not available">EST</span>
+                      )}
+                    </td>
                     {[s.change_1d, s.change_5d, s.change_20d, s.vs_nifty].map((v, j) => (
-                      <td key={j} style={{ padding: '8px 10px', color: (v || 0) >= 0 ? '#00E5A0' : '#FF455A' }} className="num">
-                        {(v || 0) >= 0 ? '+' : ''}{(v || 0).toFixed(2)}%
+                      <td key={j} style={{ padding: '8px 10px', color: v == null ? '#2A3040' : (v >= 0 ? '#00E5A0' : '#FF455A') }} className="num">
+                        {v == null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`}
                       </td>
                     ))}
                     <td style={{ padding: '8px 10px' }}>

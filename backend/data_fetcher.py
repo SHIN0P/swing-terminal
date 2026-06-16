@@ -11,13 +11,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 CACHE = {}
 
 HEALTH = {
-    'yfinance_ok':     None,
-    'nse_ok':          None,
-    'active_source':   'unknown',
-    'last_live_fetch': None,
-    'last_attempt':    None,
-    'bulk_deals_real': None,
-    'fii_dii_real':    None,
+    'yfinance_ok':         None,
+    'nse_ok':              None,
+    'nse_stocklist_ok':    None,
+    'active_source':       'unknown',
+    'last_live_fetch':     None,
+    'last_attempt':        None,
+    'bulk_deals_real':     None,
+    'fii_dii_real':        None,    # today's NSE figure
+    'fii_dii_history_real': None,   # niftytrader historical scrape
+    'prices_real':         None,    # all 50 stock prices from live yfinance
 }
 
 # ── Disk cache ─────────────────────────────────────────────────────────────────
@@ -187,38 +190,93 @@ def get_nse_session():
     return s
 
 
-# ── Sample / fallback data ─────────────────────────────────────────────────────
+# ── FII / DII — real data only, no fabrication ──────────────────────────────────
+#
+# Two real sources, merged honestly:
+#   1. nsepython.nse_fiidii()    → TODAY's real full buy/sell/net breakdown.
+#      Every day this server runs, that real reading is appended to a
+#      permanent on-disk log (fii_dii_log.json) — an honest archive that
+#      grows richer over time. Never overwritten with guesses.
+#   2. niftytrader.in scrape     → real historical NET-only values (verified
+#      to match NSE's own numbers exactly — see HISTORY.md). Used only to
+#      backfill days before our own log existed. No buy/sell breakdown is
+#      invented for those days; fii_buy/fii_sell/dii_buy/dii_sell are left
+#      as None and the record is tagged 'source': 'net_only'.
+#
+# If a day has neither a log entry nor a scrape entry, it is simply omitted.
+# No random numbers are ever generated for FII/DII data.
 
-def make_sample_fii_dii(days=30):
-    # Each calendar day gets its own seed → same day always returns same numbers.
-    result = []
-    for i in range(days, 0, -1):
-        d = datetime.now() - timedelta(days=i)
-        if d.weekday() >= 5:
-            continue
-        rng = random.Random(int(d.strftime('%Y%m%d')))
-        fii_net = rng.randint(-3000, 4000)
-        dii_net = rng.randint(-500,  5000)
-        result.append({
-            'date':     d.strftime('%d-%b-%Y'),
-            'fii_buy':  abs(fii_net) + rng.randint(5000, 15000),
-            'fii_sell': abs(fii_net) + rng.randint(4000, 13000),
-            'fii_net':  fii_net,
-            'dii_buy':  abs(dii_net) + rng.randint(3000, 10000),
-            'dii_sell': abs(dii_net) + rng.randint(2000,  8000),
-            'dii_net':  dii_net,
-        })
-    return result[-days:]
+FIIDII_LOG_PATH = os.path.join(CACHE_DIR, 'fii_dii_log.json')   # not date-suffixed — persists forever
 
 
-# ── FII / DII ──────────────────────────────────────────────────────────────────
+def _load_fiidii_log() -> dict:
+    _ensure_cache_dir()
+    if os.path.exists(FIIDII_LOG_PATH):
+        try:
+            with open(FIIDII_LOG_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f'[FII/DII LOG] read error: {e}')
+    return {}
+
+
+def _save_fiidii_log(log: dict) -> None:
+    try:
+        tmp = FIIDII_LOG_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(log, f, separators=(',', ':'))
+        os.replace(tmp, FIIDII_LOG_PATH)
+    except Exception as e:
+        print(f'[FII/DII LOG] write error: {e}')
+
+
+def _scrape_fiidii_history_niftytrader(limit_days=90):
+    """
+    Real historical FII/DII NET values, scraped from the __NEXT_DATA__ JSON
+    niftytrader.in embeds in its fii-dii-data page. These are NSE's own
+    provisional figures republished — verified against nse_fiidii() to
+    match exactly for the current day. NET only; no buy/sell breakdown.
+    Cached once per day (the page itself only updates once per day, after
+    NSE publishes provisional figures each evening).
+    """
+    cached = cache_get('fiidii_history_scrape')
+    if cached is not None:
+        return cached
+    try:
+        import re
+        s = requests.Session()
+        s.headers.update({'User-Agent': NSE_HEADERS['User-Agent']})
+        r = s.get('https://www.niftytrader.in/fii-dii-data', timeout=15)
+        m = re.search(r'__NEXT_DATA__"\s*type="application/json">(.*?)</script>', r.text)
+        if not m:
+            raise ValueError('__NEXT_DATA__ blob not found — page structure may have changed')
+        blob = json.loads(m.group(1))
+        series = blob['props']['pageProps']['series']
+        result = []
+        for row in series[-limit_days:]:
+            d = datetime.strptime(row['created_at'][:10], '%Y-%m-%d')
+            result.append({
+                'date':    d.strftime('%d-%b-%Y'),
+                'fii_net': round(float(row.get('fii_net_value', 0) or 0), 2),
+                'dii_net': round(float(row.get('dii_net_value', 0) or 0), 2),
+            })
+        result.reverse()   # newest first
+        cache_set('fiidii_history_scrape', result, stable_ttl())
+        HEALTH['fii_dii_history_real'] = True
+        print(f'[FII/DII] niftytrader scrape OK: {len(result)} real historical days (net-only)')
+        return result
+    except Exception as e:
+        HEALTH['fii_dii_history_real'] = False
+        print(f'[FII/DII] WARNING: niftytrader scrape failed: {e} — only days in our own log will show')
+        return []
+
 
 def get_fii_dii_data(days=30):
     cached = cache_get(f'fii_{days}')
-    if cached:
+    if cached is not None:
         return cached
 
-    # Step 1: Try to get TODAY's real FII/DII from NSE via nsepython
+    # 1. TODAY's real full buy/sell/net breakdown straight from NSE
     today_real = None
     try:
         from nsepython import nse_fiidii
@@ -227,31 +285,58 @@ def get_fii_dii_data(days=30):
         dii_row = df[df['category'].str.contains('DII', case=False)].iloc[0]
         today_real = {
             'date':     fii_row['date'],
-            'fii_buy':  float(fii_row['buyValue']),
-            'fii_sell': float(fii_row['sellValue']),
-            'fii_net':  float(fii_row['netValue']),
-            'dii_buy':  float(dii_row['buyValue']),
-            'dii_sell': float(dii_row['sellValue']),
-            'dii_net':  float(dii_row['netValue']),
+            'fii_buy':  round(float(fii_row['buyValue']), 2),
+            'fii_sell': round(float(fii_row['sellValue']), 2),
+            'fii_net':  round(float(fii_row['netValue']), 2),
+            'dii_buy':  round(float(dii_row['buyValue']), 2),
+            'dii_sell': round(float(dii_row['sellValue']), 2),
+            'dii_net':  round(float(dii_row['netValue']), 2),
+            'source':   'nse_real',
         }
         HEALTH['fii_dii_real'] = True
         print(f"[FII/DII] Real today: FII net={today_real['fii_net']}, DII net={today_real['dii_net']}")
     except Exception as e:
         HEALTH['fii_dii_real'] = False
-        print(f'[FII/DII] WARNING: NSE real data failed: {e} — chart will use estimated history')
+        print(f'[FII/DII] WARNING: NSE real data failed: {e}')
 
-    # Step 2: Build 30-day chart from deterministic seeds (stable per-day history)
-    result = make_sample_fii_dii(days)
+    # 2. Persist today's real reading into our own permanent log (honest
+    #    archive — grows by one real day every day the server runs)
+    log = _load_fiidii_log()
+    if today_real and log.get(today_real['date']) != today_real:
+        log[today_real['date']] = today_real
+        _save_fiidii_log(log)
 
-    # Step 3: Replace the last entry with real today's data if we got it
-    if today_real:
-        if result and result[-1]['date'] == today_real['date']:
-            result[-1] = today_real
+    # 3. Real net-only history from niftytrader, to backfill days before
+    #    our own log existed
+    scraped = _scrape_fiidii_history_niftytrader(max(days, 30))
+    scraped_by_date = {row['date']: row for row in scraped}
+
+    # 4. Merge — prefer our own full-breakdown log entry; else the real
+    #    net-only scrape entry; never fabricate a missing day.
+    all_dates = sorted(
+        set(log.keys()) | set(scraped_by_date.keys()),
+        key=lambda d: datetime.strptime(d, '%d-%b-%Y'),
+        reverse=True,   # newest first — matches frontend's expectation
+    )
+
+    result = []
+    for d in all_dates[:days]:
+        if d in log:
+            result.append(log[d])
         else:
-            result.append(today_real)
-            result = result[-days:]
+            net_row = scraped_by_date[d]
+            result.append({
+                'date':     d,
+                'fii_buy':  None,
+                'fii_sell': None,
+                'fii_net':  net_row['fii_net'],
+                'dii_buy':  None,
+                'dii_sell': None,
+                'dii_net':  net_row['dii_net'],
+                'source':   'net_only',
+            })
 
-    cache_set(f'fii_{days}', result)
+    cache_set(f'fii_{days}', result, stable_ttl())
     return result
 
 
@@ -416,6 +501,62 @@ def get_indices():
     return defaults
 
 
+def _fetch_index_changes(ticker):
+    """Real 1d/5d/20d % change for one index ticker, from actual historical closes."""
+    import yfinance as yf
+    df = yf.Ticker(ticker).history(period='2mo')
+    closes = df['Close'].dropna()
+    if len(closes) < 2:
+        return None
+    last = float(closes.iloc[-1])
+
+    def pct_back(n):
+        if len(closes) <= n:
+            return None
+        prev = float(closes.iloc[-1 - n])
+        return round((last - prev) / prev * 100, 2) if prev else None
+
+    return {
+        'last':       round(last, 2),
+        'change_1d':  pct_back(1),
+        'change_5d':  pct_back(5),
+        'change_20d': pct_back(20),
+    }
+
+
+def get_sector_index_changes():
+    """
+    Real 1d/5d/20d % change for every sector index, computed from actual
+    historical closes via yfinance — NOT extrapolated/guessed from the
+    1-day change. Replaces the old static-multiplier estimate.
+    """
+    cached = cache_get('sector_index_changes')
+    if cached is not None:
+        return cached
+
+    results = {}
+    try:
+        with ThreadPoolExecutor(max_workers=len(_YF_INDEX_MAP)) as ex:
+            future_to_key = {
+                ex.submit(_fetch_index_changes, ticker): key1
+                for ticker, (key1, _key2) in _YF_INDEX_MAP.items()
+            }
+            for fut in as_completed(future_to_key, timeout=30):
+                key1 = future_to_key[fut]
+                try:
+                    res = fut.result()
+                    if res:
+                        results[key1] = res
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f'[SECTOR CHANGES] parallel pool error: {e}')
+
+    cache_set('sector_index_changes', results, stable_ttl())
+    print(f'[SECTOR CHANGES] real 5d/20d computed for {len(results)}/{len(_YF_INDEX_MAP)} indices')
+    return results
+
+
 # ── Stock list ─────────────────────────────────────────────────────────────────
 
 TOP50_DATA = [
@@ -473,21 +614,73 @@ TOP50_DATA = [
 
 
 def get_stock_list():
+    """
+    Returns the 50-stock universe with REAL live prices.
+
+    TOP50_DATA only ever supplies identity fields (symbol, companyName,
+    sector) and a static marketCap reference. lastPrice / pChange are ALWAYS
+    overwritten with the real latest close from get_stock_history() (which
+    itself is yfinance-backed, self-healing — see get_stock_history). NSE's
+    NIFTY 500 list is used only as a best-effort source for delivery% and
+    traded volume; if it fails, those two fields fall back to the static
+    TOP50_DATA estimate and are tagged so callers can tell the difference.
+    """
     cached = cache_get('stocks')
     if cached:
         return cached
+
+    nse_extra = {}
     try:
         s = get_nse_session()
         r = s.get('https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20500', timeout=20)
         data = r.json().get('data', [])
-        result = [d for d in data if d.get('symbol') and d.get('symbol') != 'NIFTY 500']
-        if result:
-            cache_set('stocks', result)
-            return result
+        nse_extra = {d['symbol']: d for d in data if d.get('symbol')}
+        HEALTH['nse_stocklist_ok'] = bool(nse_extra)
     except Exception as e:
-        print(f'Stock list fetch failed: {e} — using top 50 dataset')
-    cache_set('stocks', TOP50_DATA)
-    return TOP50_DATA
+        HEALTH['nse_stocklist_ok'] = False
+        print(f'[STOCK LIST] NSE NIFTY 500 fetch failed: {e} — delivery%% will use static estimate')
+
+    result = []
+    real_price_count = 0
+    for base in TOP50_DATA:
+        sym    = base['symbol']
+        merged = {**base}
+        extra  = nse_extra.get(sym)
+
+        if extra:
+            merged['deliveryToTradedQuantity'] = extra.get('deliveryToTradedQuantity', merged.get('deliveryToTradedQuantity'))
+            merged['totalTradedVolume']        = extra.get('totalTradedVolume',        merged.get('totalTradedVolume'))
+            merged['delivery_source']          = 'nse_real'
+        else:
+            merged['delivery_source']          = 'estimated'
+
+        # PRICE: always derived from real price history, never from the
+        # hardcoded literal in TOP50_DATA. price_source reflects what
+        # get_stock_history ACTUALLY used (yfinance vs synthetic fallback),
+        # not just "did we get any rows back" — synthetic fallback also
+        # returns non-empty rows and must not be mistaken for real.
+        hist = get_stock_history(sym)
+        src  = get_price_source(sym)
+        if hist:
+            last = hist[-1]
+            prev = hist[-2] if len(hist) >= 2 else last
+            merged['lastPrice']    = last['close']
+            merged['pChange']      = round((last['close'] - prev['close']) / prev['close'] * 100, 2) if prev['close'] else 0.0
+            merged['price_source'] = 'yfinance' if src == 'yfinance' else 'synthetic'
+            if src == 'yfinance':
+                real_price_count += 1
+        else:
+            merged['price_source'] = 'unavailable'
+
+        merged['marketCap_source'] = 'static_estimate'   # no free live market-cap source wired up
+        result.append(merged)
+
+    # Strict by design: ANY synthetic price flips this to False so
+    # any_fake_data/fake_data_list never hide a single stale stock just
+    # because most others are real.
+    HEALTH['prices_real'] = real_price_count >= len(TOP50_DATA)
+    cache_set('stocks', result, stable_ttl())
+    return result
 
 
 # ── Price history ──────────────────────────────────────────────────────────────
@@ -527,49 +720,91 @@ def _make_deterministic_history(symbol: str) -> list:
     return result
 
 
+def get_price_source(symbol: str) -> str:
+    """'yfinance' (real) or 'synthetic' (fallback) for this symbol's cached price history."""
+    entry = _load_disk_prices().get(symbol)
+    return entry.get('source', 'unknown') if entry else 'unknown'
+
+
+def _fetch_yfinance_history(symbol: str):
+    """
+    Real OHLCV history from yfinance. Returns rows list, or raises on failure.
+
+    yfinance occasionally returns a trailing row for the most recent session
+    with NaN OHLC (data not finalized yet by Yahoo) while still reporting a
+    volume figure. That NaN would otherwise corrupt every price computed
+    downstream (and break JSON serialization outright) — so such rows are
+    dropped before anything else sees this data, same as a finalized close
+    is required everywhere else in the app.
+    """
+    import math
+    import yfinance as yf
+    yf_sym = symbol if '.NS' in symbol else f'{symbol}.NS'
+    df = yf.Ticker(yf_sym).history(period='3mo')
+    if df.empty:
+        raise ValueError('empty dataframe')
+    rows = []
+    for date, row in df.iterrows():
+        close = float(row['Close'])
+        if math.isnan(close):
+            continue   # unfinalized session — wait for a real close instead
+        rows.append({
+            'date':   str(date)[:10],
+            'open':   round(float(row['Open']),   2),
+            'high':   round(float(row['High']),   2),
+            'low':    round(float(row['Low']),    2),
+            'close':  round(close, 2),
+            'volume': int(row['Volume']),
+        })
+    if not rows:
+        raise ValueError('all rows had NaN close')
+    return rows
+
+
 def get_stock_history(symbol, days=90):
+    """
+    Real price history for `symbol`, with self-healing fallback.
+
+    Priority every call:
+      1. Memory cache (hot path within this process run).
+      2. Disk cache TAGGED 'yfinance' (real data already confirmed today) — trusted as-is.
+      3. Disk cache TAGGED 'synthetic' OR no disk entry at all — ALWAYS retries
+         yfinance before accepting synthetic data. This means a stale synthetic
+         entry from an earlier outage gets silently replaced with real data the
+         moment yfinance starts working again — it never blocks real data for
+         the rest of the day.
+    """
     cache_key = f'hist_{symbol}'
 
-    # 1. Memory cache (hot path — filled by prewarm or prior request)
     cached = cache_get(cache_key)
     if cached is not None:
         return cached
 
-    # 2. Disk price cache (survives server restarts — same data as yesterday's run)
     disk_prices = _load_disk_prices()
-    if symbol in disk_prices:
-        result = disk_prices[symbol]
-        cache_set(cache_key, result)
-        return result
+    entry = disk_prices.get(symbol)
+    if entry and entry.get('source') == 'yfinance':
+        cache_set(cache_key, entry['rows'])
+        return entry['rows']
 
-    # 3. Try yfinance for real price data
-    import yfinance as yf
-    yf_sym = symbol if '.NS' in symbol else f'{symbol}.NS'
+    # No real data on disk yet (either missing, or previously synthetic) —
+    # always attempt a real fetch before falling back.
     try:
-        df = yf.Ticker(yf_sym).history(period='3mo')
-        if df.empty:
-            raise ValueError('empty dataframe')
-        result = []
-        for date, row in df.iterrows():
-            result.append({
-                'date':   str(date)[:10],
-                'open':   round(float(row['Open']),   2),
-                'high':   round(float(row['High']),   2),
-                'low':    round(float(row['Low']),    2),
-                'close':  round(float(row['Close']),  2),
-                'volume': int(row['Volume']),
-            })
-        print(f'[yfinance] {symbol}: {len(result)} rows fetched')
+        rows   = _fetch_yfinance_history(symbol)
+        source = 'yfinance'
+        print(f'[yfinance] {symbol}: {len(rows)} real rows fetched')
     except Exception as e:
-        print(f'[yfinance] {symbol} failed ({e}) — using deterministic fallback')
-        result = _make_deterministic_history(symbol)
+        source = 'synthetic'
+        if entry and entry.get('source') == 'synthetic':
+            rows = entry['rows']   # deterministic — identical to a fresh regen anyway
+        else:
+            rows = _make_deterministic_history(symbol)
+        print(f'[FALLBACK] yfinance failed for {symbol} ({e}) — using synthetic data for {symbol} - NOT REAL')
 
-    # Save to disk and memory so all future calls (this run + restarts) use same data
     with _disk_lock:
-        disk_prices[symbol] = result
+        disk_prices[symbol] = {'source': source, 'rows': rows}
         _save_disk_prices()
-    cache_set(cache_key, result)
-    return result
+    cache_set(cache_key, rows)
+    return rows
 
 
 # ── Bulk deals ─────────────────────────────────────────────────────────────────
@@ -642,51 +877,98 @@ def get_bulk_deals(days=7):
     ]
 
 
+# ── Data honesty ─────────────────────────────────────────────────────────────
+# Single source of truth for "what in this app is real vs estimated right now".
+# Surfaced via /api/health and /api/data-quality so nothing fake is silent.
+
+def get_data_quality() -> dict:
+    fake_list = []
+    if HEALTH.get('prices_real') is False:
+        synthetic_syms = [s['symbol'] for s in TOP50_DATA if get_price_source(s['symbol']) == 'synthetic']
+        names = ', '.join(synthetic_syms) if synthetic_syms else 'unknown'
+        fake_list.append(f'stock_prices: {names} — yfinance has no data for these symbols right now, using synthetic fallback')
+    if HEALTH.get('fii_dii_real') is False:
+        fake_list.append('fii_dii_today (NSE unreachable)')
+    if HEALTH.get('fii_dii_history_real') is False:
+        fake_list.append('fii_dii_history (niftytrader scrape unreachable)')
+    if HEALTH.get('bulk_deals_real') is False:
+        fake_list.append('bulk_deals (NSE + nsepython unreachable — using hardcoded sample)')
+    if HEALTH.get('nse_stocklist_ok') is False:
+        fake_list.append('delivery_pct (NSE NIFTY 500 unreachable — using static estimate)')
+
+    return {
+        'prices':        'live' if HEALTH.get('prices_real')         else 'estimated',
+        'fii_dii_today': 'live' if HEALTH.get('fii_dii_real')         else 'estimated',
+        'fii_dii_history': 'live' if HEALTH.get('fii_dii_history_real') else 'estimated',
+        'bulk_deals':    'live' if HEALTH.get('bulk_deals_real')      else 'estimated',
+        'delivery_pct':  'live' if HEALTH.get('nse_stocklist_ok')     else 'estimated',
+        'shareholding':  'not_used',     # no shareholding data is fetched or shown anywhere in this app
+        'market_cap':    'static_reference',  # no free live market-cap source wired up
+        'sector_5d_20d_change': 'live',  # computed from real index history — see get_sector_index_changes()
+        'sector_fii_flows':     'estimated',  # fii_total × static sector weight — no real per-sector flow source exists free
+        'any_fake_data': len(fake_list) > 0,
+        'fake_data_list': fake_list,
+    }
+
+
 # ── Background cache pre-warmer ────────────────────────────────────────────────
-# Runs once at startup in a daemon thread so the first real request is instant.
-# Uses only the deterministic synthetic path — no yfinance on startup — so it
-# completes in <5 seconds regardless of network conditions.
+# Runs once at startup in a daemon thread so the first real request doesn't
+# block on 50 sequential yfinance calls. Fetches real data in parallel;
+# only falls back to deterministic synthetic data (loudly logged) per-symbol
+# if yfinance genuinely fails for that symbol.
 
 def _prewarm():
     """
-    Fill memory cache with price histories for all 50 stocks.
-    Priority: disk cache (today's file) > deterministic fallback.
-    Never calls yfinance — fast and deterministic.
+    Fill memory + disk cache with REAL price histories for all 50 stocks
+    before the first request arrives. Tries yfinance in parallel for every
+    symbol that isn't already confirmed-real on disk; only falls back to
+    deterministic synthetic data (loudly logged) for symbols yfinance can't
+    serve. This is what makes the very first /api/scanner call of the day
+    show real prices instead of stale hardcoded ones.
     """
-    print('[PREWARM] Starting background cache warm-up...')
+    print('[PREWARM] Starting background cache warm-up (live yfinance fetch)...')
     try:
         get_indices()
         get_fii_dii_data(30)
 
-        # Load disk prices first — if they exist, all 50 stocks are ready instantly.
-        disk_prices  = _load_disk_prices()
-        new_symbols  = []
-
+        disk_prices = _load_disk_prices()
+        pending     = []
         for stock in sorted(TOP50_DATA, key=lambda x: x['symbol']):
             sym = stock['symbol']
-
-            # Already in memory cache — nothing to do
             if cache_get(f'hist_{sym}') is not None:
                 continue
-
-            # In disk cache — load to memory
-            if sym in disk_prices:
-                cache_set(f'hist_{sym}', disk_prices[sym])
+            entry = disk_prices.get(sym)
+            if entry and entry.get('source') == 'yfinance':
+                cache_set(f'hist_{sym}', entry['rows'])
                 continue
+            pending.append(sym)
 
-            # Not on disk either — generate deterministic fallback and queue for disk save
-            result = _make_deterministic_history(sym)
-            cache_set(f'hist_{sym}', result)
-            disk_prices[sym] = result
-            new_symbols.append(sym)
+        real_count, fake_count = 0, 0
+        if pending:
+            with ThreadPoolExecutor(max_workers=10) as ex:
+                future_to_sym = {ex.submit(_fetch_yfinance_history, sym): sym for sym in pending}
+                for fut in as_completed(future_to_sym, timeout=60):
+                    sym = future_to_sym[fut]
+                    try:
+                        rows   = fut.result()
+                        source = 'yfinance'
+                        real_count += 1
+                    except Exception as e:
+                        existing = disk_prices.get(sym)
+                        rows     = existing['rows'] if existing and existing.get('source') == 'synthetic' else _make_deterministic_history(sym)
+                        source   = 'synthetic'
+                        fake_count += 1
+                        print(f'[FALLBACK] yfinance failed for {sym} ({e}) — using synthetic data for {sym} - NOT REAL')
+                    cache_set(f'hist_{sym}', rows)
+                    disk_prices[sym] = {'source': source, 'rows': rows}
 
-        # Persist any newly generated histories to disk in one write
-        if new_symbols:
             with _disk_lock:
                 _save_disk_prices()
-            print(f'[PREWARM] Generated + saved {len(new_symbols)} new symbol histories to disk')
 
-        print(f'[PREWARM] Done — {len(TOP50_DATA)} stocks warm ({len(disk_prices)} from disk).')
+        HEALTH['prices_real'] = fake_count == 0
+        print(f'[PREWARM] Done — {len(TOP50_DATA)} stocks warm. '
+              f'{real_count} fetched live this run, {fake_count} synthetic, '
+              f'{len(TOP50_DATA) - len(pending)} already cached real from disk.')
     except Exception as e:
         print(f'[PREWARM] Error: {e}')
 

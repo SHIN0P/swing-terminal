@@ -19,7 +19,8 @@ try:
         get_stock_history, get_bulk_deals, CACHE, HEALTH, is_market_open,
         cache_get, cache_set, scanner_ttl, TOP50_DATA,
         disk_cache_get, disk_cache_set, disk_cache_clear_today,
-        disk_cache_path, get_today_str, CACHE_DIR,
+        get_today_str, CACHE_DIR,
+        get_sector_index_changes, get_data_quality, get_price_source,
     )
 except Exception as _e:
     _import_errors.append(f"data_fetcher: {_e}")
@@ -175,6 +176,12 @@ def fii_dii_endpoint(days: int = 30):
         'fii_today':        round(data[0]['fii_net'] if data else 0, 2),
         'dii_today':        round(data[0]['dii_net'] if data else 0, 2),
         'bulk_deals':       bulk,
+        'data_quality': {
+            'fii_dii_today':   'live' if HEALTH.get('fii_dii_real')         else 'estimated',
+            'fii_dii_history': 'live' if HEALTH.get('fii_dii_history_real') else 'estimated',
+            'bulk_deals':      'live' if HEALTH.get('bulk_deals_real')      else 'estimated',
+            'sector_flows':    'estimated',  # fii_total × static weight — no real per-sector flow source exists free
+        },
     }
 
 
@@ -185,45 +192,61 @@ def sectors_endpoint():
     indices      = get_indices()
     nifty_change = indices.get('nifty50_change', 0)
 
+    # Real 1d/5d/20d change per sector index, computed from actual historical
+    # closes — NOT extrapolated/guessed from the 1-day move (old behaviour).
+    real_changes = get_sector_index_changes()
+
     SECTOR_DEFS = [
-        ('Banking',  'nifty_bank',    [0.28, 3.2, 8.5]),
-        ('IT',       'nifty_it',      [0.18, 2.8, 7.2]),
-        ('Pharma',   'nifty_pharma',  [0.09, 3.0, 9.0]),
-        ('Auto',     'nifty_auto',    [0.10, 2.5, 6.8]),
-        ('FMCG',     'nifty_fmcg',    [0.08, 2.2, 5.5]),
-        ('Metal',    'nifty_metal',   [0.07, 3.5, 10.2]),
-        ('Realty',   'nifty_realty',  [0.04, 4.0, 12.0]),
-        ('Energy',   'nifty_energy',  [0.12, 2.8, 7.5]),
-        ('Infra',    'nifty_infra',   [0.08, 2.6, 7.0]),
-        ('Telecom',  'nifty_telecom', [0.05, 3.2, 9.5]),
+        ('Banking',  'nifty_bank'),
+        ('IT',       'nifty_it'),
+        ('Pharma',   'nifty_pharma'),
+        ('Auto',     'nifty_auto'),
+        ('FMCG',     'nifty_fmcg'),
+        ('Metal',    'nifty_metal'),
+        ('Realty',   'nifty_realty'),
+        ('Energy',   'nifty_energy'),
+        ('Infra',    'nifty_infra'),
+        ('Telecom',  'nifty_telecom'),
     ]
 
     sectors = []
-    for name, key, mults in SECTOR_DEFS:
-        c1  = indices.get(f'{key}_change', 0)
-        c5  = round(c1 * mults[1], 2)
-        c20 = round(c1 * mults[2], 2)
-        raw_score = (c1 * 3 + c5 * 2 + c20) / 6 * 10
+    for name, key in SECTOR_DEFS:
+        real = real_changes.get(key)
+        if real:
+            c1, c5, c20 = real.get('change_1d', 0) or 0, real.get('change_5d'), real.get('change_20d')
+            data_quality = 'live'
+        else:
+            # yfinance unreachable for this index right now — fall back to
+            # the live 1-day figure only; 5d/20d are not fabricated, just
+            # omitted (None) and flagged.
+            c1 = indices.get(f'{key}_change', 0)
+            c5 = c20 = None
+            data_quality = 'estimated'
+
+        c5_for_score  = c5  if c5  is not None else c1 * 3
+        c20_for_score = c20 if c20 is not None else c1 * 8
+        raw_score = (c1 * 3 + c5_for_score * 2 + c20_for_score) / 6 * 10
         score     = min(100, max(0, round(raw_score + 50, 1)))
 
         if score >= 65:   signal = 'OVERWEIGHT'
         elif score >= 45: signal = 'NEUTRAL'
         else:             signal = 'UNDERWEIGHT'
 
-        if c1 > 2 and c5 > 3:    fii_bias = '▲ BUYING'
-        elif c1 < -1 and c5 < -2: fii_bias = '▼ SELLING'
-        else:                      fii_bias = '→ NEUTRAL'
+        if c1 > 2 and (c5 or 0) > 3:     fii_bias = '▲ BUYING'
+        elif c1 < -1 and (c5 or 0) < -2: fii_bias = '▼ SELLING'
+        else:                             fii_bias = '→ NEUTRAL'
 
         sectors.append({
-            'name':      name,
-            'change_1d': round(c1, 2),
-            'change_5d': c5,
-            'change_20d': c20,
-            'vs_nifty':  round(c1 - nifty_change, 2),
-            'score':     score,
-            'signal':    signal,
-            'fii_bias':  fii_bias,
-            'value':     indices.get(key, 0),
+            'name':         name,
+            'change_1d':    round(c1, 2),
+            'change_5d':    round(c5, 2)  if c5  is not None else None,
+            'change_20d':   round(c20, 2) if c20 is not None else None,
+            'vs_nifty':     round(c1 - nifty_change, 2),
+            'score':        score,
+            'signal':       signal,
+            'fii_bias':     fii_bias,
+            'value':        indices.get(key, 0),
+            'data_quality': data_quality,
         })
 
     return sorted(sectors, key=lambda x: x['score'], reverse=True)
@@ -307,11 +330,14 @@ def _build_all_scores():
         price   = ind.get('close') or float(stock.get('lastPrice', 0) or 0)
         levels  = get_trade_levels(price, ind.get('atr', price * 0.02), signal)
 
+        price_src = get_price_source(sym)
+
         results.append({
             'symbol':            sym,
             'company':           stock.get('companyName', sym),
             'sector':            stock_sector,
             'price':             price,
+            'price_source':      'live' if price_src == 'yfinance' else 'estimated',
             'change_pct':        float(stock.get('pChange', 0) or 0),
             'composite_score':   comp,
             'tech_score':        scored['tech_score'],
@@ -501,19 +527,39 @@ def remove_position(pid: int):
 def health_check():
     last_live  = HEALTH.get('last_live_fetch')
     last_try   = HEALTH.get('last_attempt')
+    quality    = get_data_quality()
+
+    try:
+        import nsepython  # noqa: F401 — import-success check only
+        nsepython_working = True
+    except Exception:
+        nsepython_working = False
+
     return {
-        'status':              'ok',
-        'yfinance_working':    HEALTH.get('yfinance_ok'),
-        'nse_working':         HEALTH.get('nse_ok'),
-        'active_data_source':  HEALTH.get('active_source', 'unknown'),
-        'bulk_deals_real':     HEALTH.get('bulk_deals_real'),
-        'fii_dii_real':        HEALTH.get('fii_dii_real'),
-        'market_open':         is_market_open(),
-        'last_live_fetch':     last_live.strftime('%d %b %Y, %I:%M %p IST') if last_live else None,
-        'last_fetch_attempt':  last_try.strftime('%d %b %Y, %I:%M %p IST')  if last_try  else None,
-        'cache_entries':       len(CACHE),
-        'import_errors':       _import_errors,
+        'status':               'ok',
+        'yfinance_working':      HEALTH.get('yfinance_ok'),
+        'nsepython_working':     nsepython_working,
+        'nse_working':           HEALTH.get('nse_ok'),
+        'active_data_source':    HEALTH.get('active_source', 'unknown'),
+        'prices_real':           HEALTH.get('prices_real'),
+        'fii_dii_real':          HEALTH.get('fii_dii_real'),
+        'fii_dii_history_real':  HEALTH.get('fii_dii_history_real'),
+        'bulk_deals_real':       HEALTH.get('bulk_deals_real'),
+        'shareholding_real':     None,   # not applicable — this app does not fetch/show shareholding data
+        'any_fake_data':         quality['any_fake_data'],
+        'fake_data_list':        quality['fake_data_list'],
+        'market_open':           is_market_open(),
+        'last_live_fetch':       last_live.strftime('%d %b %Y, %I:%M %p IST') if last_live else None,
+        'last_fetch_attempt':    last_try.strftime('%d %b %Y, %I:%M %p IST')  if last_try  else None,
+        'cache_entries':         len(CACHE),
+        'import_errors':         _import_errors,
     }
+
+
+@app.get('/api/data-quality')
+def data_quality_endpoint():
+    """Machine-readable summary of what's real vs estimated, for an honest UI badge."""
+    return get_data_quality()
 
 
 @app.get('/api/refresh')

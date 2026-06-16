@@ -41,7 +41,16 @@ function OpCard({ op, index }) {
     }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div>
-          <div style={{ fontSize: 16, fontWeight: 700, color: '#C8D0DC' }}>{op.symbol}</div>
+          <div style={{ fontSize: 16, fontWeight: 700, color: '#C8D0DC' }}>
+            {op.symbol}
+            {op.price_source === 'estimated' && (
+              <span style={{
+                marginLeft: 6, fontSize: 7, fontWeight: 700, letterSpacing: 0.5,
+                color: '#FFB020', border: '1px solid rgba(255,176,32,0.3)',
+                borderRadius: 2, padding: '1px 4px', verticalAlign: 'middle',
+              }} title="yfinance unreachable for this symbol — levels based on synthetic fallback price">EST</span>
+            )}
+          </div>
           <div style={{ fontSize: 8, color: '#2A3040', marginTop: 3, letterSpacing: 1 }}>{op.sector}</div>
         </div>
         <div style={{ textAlign: 'right' }}>

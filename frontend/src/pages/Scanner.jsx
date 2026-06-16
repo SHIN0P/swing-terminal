@@ -132,7 +132,16 @@ export default function Scanner() {
                   >
                     <td style={{ padding: '9px 10px', color: '#C8D0DC', fontWeight: 700 }}>{s.symbol}</td>
                     <td style={{ padding: '9px 10px', color: '#4B5563', fontSize: 10 }}>{s.sector}</td>
-                    <td style={{ padding: '9px 10px', color: '#8B99A8' }} className="num">₹{(s.price || 0).toLocaleString('en-IN')}</td>
+                    <td style={{ padding: '9px 10px', color: '#8B99A8' }} className="num">
+                      ₹{(s.price || 0).toLocaleString('en-IN')}
+                      {s.price_source === 'estimated' && (
+                        <span style={{
+                          marginLeft: 5, fontSize: 7, fontWeight: 700, letterSpacing: 0.5,
+                          color: '#FFB020', border: '1px solid rgba(255,176,32,0.3)',
+                          borderRadius: 2, padding: '1px 3px', verticalAlign: 'middle',
+                        }} title="yfinance unreachable for this symbol — showing synthetic fallback price">EST</span>
+                      )}
+                    </td>
                     <td style={{ padding: '9px 10px', color: (s.change_pct || 0) >= 0 ? '#00E5A0' : '#FF455A' }} className="num">
                       {(s.change_pct || 0) >= 0 ? '+' : ''}{(s.change_pct || 0).toFixed(2)}%
                     </td>
